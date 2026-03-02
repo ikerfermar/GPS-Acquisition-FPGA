@@ -1,0 +1,15 @@
+# Ignorar carpetas temporales de Vivado
+*.cache/
+*.hw/
+*.ip_user_files/
+*.runs/
+*.sim/
+*.gen/
+
+# Ignorar archivos de log y journal
+*.log
+*.jou
+*.str
+
+# Ignorar archivos de backup
+*.backup*
