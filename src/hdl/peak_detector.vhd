@@ -43,6 +43,8 @@ begin
     im <= signed(din_data(31 downto 16));
 
     process(clk)
+        variable v_re_abs   : unsigned(15 downto 0);
+        variable v_im_abs   : unsigned(15 downto 0);
         variable v_mag      : unsigned(15 downto 0);
         variable v_max      : unsigned(15 downto 0);
         variable v_sum      : unsigned(31 downto 0);
@@ -59,7 +61,24 @@ begin
                 max_pos_reg     <= (others => '0');
                 noise_floor_reg <= (others => '0');
             elsif din_valid = '1' then
-                v_mag := unsigned(abs(re)) + unsigned(abs(im));
+                -- FIX: abs(signed(-32768,16)) overflows back to -32768 in NUMERIC_STD.
+                -- Saturate x"8000" to x"7FFF" (32767) so the sum never wraps.
+                -- All other negative values are negated correctly via 2's complement.
+                if re = "1000000000000000" then
+                    v_re_abs := to_unsigned(32767, 16);
+                elsif re(15) = '1' then
+                    v_re_abs := unsigned(not std_logic_vector(re)) + 1;
+                else
+                    v_re_abs := unsigned(std_logic_vector(re));
+                end if;
+                if im = "1000000000000000" then
+                    v_im_abs := to_unsigned(32767, 16);
+                elsif im(15) = '1' then
+                    v_im_abs := unsigned(not std_logic_vector(im)) + 1;
+                else
+                    v_im_abs := unsigned(std_logic_vector(im));
+                end if;
+                v_mag := v_re_abs + v_im_abs;  -- max 32767+32767=65534, no overflow
                 v_max := current_max;
                 v_sum := sum_accum + v_mag;
 

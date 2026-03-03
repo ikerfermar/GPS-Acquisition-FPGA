@@ -84,11 +84,13 @@ architecture Behavioral of fft_controller is
     signal fft_busy       : std_logic := '0';
 
     -- Bus AXI-S hacia las FFTs (RX y CA comparten tvalid/tlast)
-    signal s_fft_rx_tdata  : std_logic_vector(31 downto 0) := (others => '0');
-    signal s_fft_loc_tdata : std_logic_vector(31 downto 0) := (others => '0');
-    signal s_fft_tvalid    : std_logic := '0';
-    signal s_fft_tlast     : std_logic := '0';
-    signal s_fft_tready    : std_logic;
+    signal s_fft_rx_tdata   : std_logic_vector(31 downto 0) := (others => '0');
+    signal s_fft_loc_tdata  : std_logic_vector(31 downto 0) := (others => '0');
+    signal s_fft_tvalid     : std_logic := '0';
+    signal s_fft_tlast      : std_logic := '0';
+    signal s_fft_rx_tready  : std_logic;  -- FIX: tready individual para cada FFT
+    signal s_fft_loc_tready : std_logic;
+    signal s_fft_tready     : std_logic;  -- AND de ambos tready
 
     -- Salidas FFT forward
     signal m_fft_rx_tdata  : std_logic_vector(63 downto 0);
@@ -183,6 +185,9 @@ begin
         end if;
     end process;
 
+    -- FIX: tready combinado: la carga solo avanza si AMBAS FFTs estan listas
+    s_fft_tready <= s_fft_rx_tready and s_fft_loc_tready;
+
     -- FFT canal RX
     fft_rx_inst : xfft_0 PORT MAP (
         aclk                 => clk,
@@ -192,7 +197,7 @@ begin
         s_axis_config_tvalid => '1',
         s_axis_data_tdata    => s_fft_rx_tdata,
         s_axis_data_tvalid   => s_fft_tvalid,
-        s_axis_data_tready   => s_fft_tready,
+        s_axis_data_tready   => s_fft_rx_tready,
         s_axis_data_tlast    => s_fft_tlast,
         m_axis_data_tdata    => m_fft_rx_tdata,
         m_axis_data_tvalid   => m_fft_rx_tvalid,
@@ -200,7 +205,7 @@ begin
         m_axis_data_tlast    => m_fft_rx_tlast
     );
 
-    -- FFT canal CA local (comparte tvalid/tlast con RX → siempre sincronizados)
+    -- FFT canal CA local (comparte tvalid/tlast con RX - FIX: tready conectado)
     fft_loc_inst : xfft_0 PORT MAP (
         aclk                 => clk,
         aclken               => '1',
@@ -209,7 +214,7 @@ begin
         s_axis_config_tvalid => '1',
         s_axis_data_tdata    => s_fft_loc_tdata,
         s_axis_data_tvalid   => s_fft_tvalid,
-        s_axis_data_tready   => open,
+        s_axis_data_tready   => s_fft_loc_tready,
         s_axis_data_tlast    => s_fft_tlast,
         m_axis_data_tdata    => m_fft_loc_tdata,
         m_axis_data_tvalid   => open,

@@ -1,0 +1,13 @@
+[main]
+standard = "1993"
+
+[libraries.ieee]
+files = [
+  "C:/Xilinx/2025.1/data/vhdl/src/ieee/distributable/*.vhd"
+]
+
+[libraries.work]
+files = [
+  "src/hdl/*.vhd",
+  "src/ip/**/*.vhd"
+]

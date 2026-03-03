@@ -44,7 +44,7 @@ entity uart_reporter is
     Generic (
         CLK_FREQ  : integer := 100_000_000;
         BAUD_RATE : integer := 115_200;
-        NUM_PRNS  : integer := 8
+        NUM_PRNS  : integer := 32  -- FIX: coherente con CFG_NUM_PRNS del paquete
     );
     Port (
         clk          : in  STD_LOGIC;
@@ -294,7 +294,7 @@ begin
                             b(vi) := x"65"; vi := vi + 1;  -- e
                             b(vi) := x"72"; vi := vi + 1;  -- r
                             b(vi) := x"3D"; vi := vi + 1;  -- =
-                            dop_s := -signed(pending_dop);
+                            dop_s := signed(pending_dop);  -- FIX: sin negacion (bin>0 = Doppler positivo)
                             if dop_s < 0 then
                                 b(vi) := x"2D"; vi := vi + 1;  -- -
                                 dop_a := to_integer(-dop_s) * 320;

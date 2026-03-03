@@ -1,8 +1,0 @@
-[main]
-standard = "1993"
-
-[libraries]
-ieee = ["C:/Xilinx/Vivado/202X.X/data/vhdl/src/ieee/*.vhd"] # <-- AJUSTA TU VERSIÓN
-
-[sets]
-sources = ["src/hdl/*.vhd"]

@@ -17,7 +17,7 @@ use IEEE.NUMERIC_STD.ALL;
 --
 -- La Basys-3 tiene un puente FTDI FT2232HQ conectado al pin
 -- JA[0] (o directamente al pad USB). Revisar el XDC:
---   set_property PACKAGE_PIN A18 [get_ports uart_tx]  -- FTDI RXD
+--   set_property PACKAGE_PIN A18 [get_ports uart_tx_pin]  -- FTDI RXD
 -- =============================================================
 
 entity uart_tx is

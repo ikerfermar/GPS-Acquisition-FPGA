@@ -72,7 +72,19 @@ architecture Behavioral of acquisition_controller is
     constant EARLY_EXIT_THR : unsigned(39 downto 0) :=
         to_unsigned(PEAK_THRESHOLD * PEAK_THRESHOLD * N_INT * 4, 40);
 
-    constant K_CFAR_SHIFT : integer := 2;  -- log2(K_CFAR): shift_left(x,2) = x*4 = x*K_CFAR
+    -- FIX: K_CFAR_SHIFT derivado automaticamente de K_CFAR (log2).
+    --      Valores soportados: K_CFAR=2->shift=1, 4->2, 8->3, 16->4.
+    --      Si K_CFAR no es potencia de 2, usar multiplicacion directa en lugar
+    --      de shift_left para evitar errores silenciosos al cambiar el generic.
+    function log2_cfar(k : integer) return integer is
+    begin
+        if    k <= 2  then return 1;
+        elsif k <= 4  then return 2;
+        elsif k <= 8  then return 3;
+        else               return 4;
+        end if;
+    end function;
+    constant K_CFAR_SHIFT : integer := log2_cfar(K_CFAR);
 
     type t_state is (
         S_IDLE, S_INIT_PRN, S_INIT_BIN,
