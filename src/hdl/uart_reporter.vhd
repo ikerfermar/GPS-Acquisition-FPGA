@@ -3,41 +3,29 @@ use IEEE.STD_LOGIC_1164.ALL;
 use IEEE.NUMERIC_STD.ALL;
 
 -- =============================================================
--- uart_reporter.vhd  (v11 - force_reset no interrumpe, cierra limpio)
+-- uart_reporter.vhd  (v12 - salida HEX, sin division, mejor timing)
 --
--- PROBLEMA CORREGIDO respecto a v10
--- ────────────────────────────────────────────────────────────
--- v10 usaba un bloque de alta prioridad "elsif force_reset='1'"
--- que saltaba a S_IDLE INMEDIATAMENTE desde cualquier estado.
--- Si SW14 bajaba mientras el reporter estaba en S_WAIT_WR,
--- el TOTAL y el FOOTER nunca se enviaban: el adquisidor se
--- reseteaba, dejaba de mandar wr_en/acq_done, y el reporter
--- se quedaba en S_WAIT_WR hasta que force_reset lo sacaba
--- a S_IDLE sin pasar por S_FORMAT_TOTAL ni S_SEND_FTR.
+-- Formato de salida (todo hexadecimal, sin divisiones):
 --
--- FIX v11: force_reset se gestiona DENTRO de los estados:
+-- Header: "\r\n=== GPS ACQUISITION RESULTS ===\r\n"
 --
---   S_IDLE    → si force_reset='1': limpiar pendientes, no arrancar.
---               Si force_reset='0' y sweep_pend='1': arrancar normal.
+-- SAT adquirido (43 bytes):
+--   "SAT XX: ACQ dop=SXX ph=XXX snr=XXXX\r\n"
+--   XX  = PRN (hex 2 digitos, 1-based -> prn_addr+1)
+--   S   = '+' o '-'
+--   XX  = valor absoluto del bin Doppler (hex 2 digitos)
+--   XXX = fase (hex 3 digitos, 0-3FF)
+--   XXXX= SNR  (hex 4 digitos)
 --
---   S_WAIT_WR → si force_reset='1' y no hay pending_wr/report_pend:
---               ir a S_FORMAT_TOTAL → enviar TOTAL (parcial) + FOOTER.
---               El receptor verá un mensaje completo aunque el barrido
---               fue interrumpido a mitad.
+-- SAT no adquirido (16 bytes):
+--   "SAT XX: NOLOCK\r\n"
 --
---   S_DONE    → si force_reset='1': limpiar y volver a S_IDLE.
---               No relanzar barrido hasta que SW14 suba.
+-- Footer total:
+--   "TOTAL: XX sats\r\n"
+--   "================================\r\n"
 --
--- Los estados S_SEND_HDR, S_FORMAT_SAT, S_SEND_LINE, S_FORMAT_TOTAL,
--- S_SEND_TOTAL, S_SEND_FTR completan su trabajo sin interrupciones.
--- Esto garantiza que el UART siempre manda mensajes completos.
---
--- Flujo con SW14:
---   SW14↓ → reporter termina línea actual → S_WAIT_WR
---          → detecta force_reset → S_FORMAT_TOTAL → TOTAL → FOOTER
---          → S_DONE → S_IDLE (limpio, silencioso)
---   SW14↑ → adquisidor emite sweep_restart → sweep_pend='1'
---          → S_IDLE detecta sweep_pend → HEADER → barrido limpio
+-- Ventaja: nibble->hex no requiere ninguna division/mod.
+-- Elimina los 14 estados PREP_* de v11 -> FSM mucho mas pequenia.
 -- =============================================================
 
 entity uart_reporter is
@@ -56,6 +44,9 @@ entity uart_reporter is
         wr_doppler   : in  STD_LOGIC_VECTOR(7 downto 0);
         wr_phase     : in  STD_LOGIC_VECTOR(9 downto 0);
         wr_snr       : in  STD_LOGIC_VECTOR(15 downto 0);
+        wr_noise     : in  STD_LOGIC_VECTOR(15 downto 0);
+        wr_margin    : in  STD_LOGIC_VECTOR(15 downto 0);
+        wr_flags     : in  STD_LOGIC_VECTOR(7 downto 0);
         sweep_start  : in  STD_LOGIC;
         report_start : in  STD_LOGIC;
         uart_tx_pin  : out STD_LOGIC;
@@ -93,12 +84,46 @@ architecture Behavioral of uart_reporter is
     signal tx_start_r : std_logic := '0';
     signal tx_busy    : std_logic;
 
-    signal pending_wr  : std_logic := '0';
     signal pending_prn : std_logic_vector(4 downto 0) := (others => '0');
     signal pending_acq : std_logic := '0';
     signal pending_dop : std_logic_vector(7 downto 0) := (others => '0');
     signal pending_ph  : std_logic_vector(9 downto 0) := (others => '0');
     signal pending_snr : std_logic_vector(15 downto 0) := (others => '0');
+    signal pending_nse : std_logic_vector(15 downto 0) := (others => '0');
+    signal pending_mrg : std_logic_vector(15 downto 0) := (others => '0');
+    signal pending_flg : std_logic_vector(7 downto 0) := (others => '0');
+
+    constant FIFO_DEPTH : integer := 64;
+    subtype fifo_idx_t is integer range 0 to FIFO_DEPTH - 1;
+    type fifo_prn_t is array (fifo_idx_t) of std_logic_vector(4 downto 0);
+    type fifo_acq_t is array (fifo_idx_t) of std_logic;
+    type fifo_dop_t is array (fifo_idx_t) of std_logic_vector(7 downto 0);
+    type fifo_ph_t  is array (fifo_idx_t) of std_logic_vector(9 downto 0);
+    type fifo_m16_t is array (fifo_idx_t) of std_logic_vector(15 downto 0);
+    type fifo_f8_t  is array (fifo_idx_t) of std_logic_vector(7 downto 0);
+
+    attribute ram_style : string;
+
+    signal fifo_prn : fifo_prn_t := (others => (others => '0'));
+    signal fifo_acq : fifo_acq_t := (others => '0');
+    signal fifo_dop : fifo_dop_t := (others => (others => '0'));
+    signal fifo_ph  : fifo_ph_t  := (others => (others => '0'));
+    signal fifo_snr : fifo_m16_t := (others => (others => '0'));
+    signal fifo_nse : fifo_m16_t := (others => (others => '0'));
+    signal fifo_mrg : fifo_m16_t := (others => (others => '0'));
+    signal fifo_flg : fifo_f8_t  := (others => (others => '0'));
+    attribute ram_style of fifo_prn : signal is "distributed";
+    attribute ram_style of fifo_acq : signal is "distributed";
+    attribute ram_style of fifo_dop : signal is "distributed";
+    attribute ram_style of fifo_ph  : signal is "distributed";
+    attribute ram_style of fifo_snr : signal is "distributed";
+    attribute ram_style of fifo_nse : signal is "distributed";
+    attribute ram_style of fifo_mrg : signal is "distributed";
+    attribute ram_style of fifo_flg : signal is "distributed";
+    signal fifo_wr_ptr : fifo_idx_t := 0;
+    signal fifo_rd_ptr : fifo_idx_t := 0;
+    signal fifo_count  : integer range 0 to FIFO_DEPTH := 0;
+
     signal report_pend : std_logic := '0';
     signal sweep_pend  : std_logic := '0';
 
@@ -112,12 +137,16 @@ architecture Behavioral of uart_reporter is
     signal tot_idx  : integer range 0 to 31 := 0;
     signal tot_len  : integer range 0 to 31 := 0;
 
+    -- Line buffer: max 72 bytes.
     type buf72_t is array (0 to 71) of std_logic_vector(7 downto 0);
     signal lbuf : buf72_t := (others => x"20");
-    signal tbuf : buf72_t := (others => x"20");
+    -- Total buffer
+    type buf32_t is array (0 to 31) of std_logic_vector(7 downto 0);
+    signal tbuf : buf32_t := (others => x"20");
 
     constant HDR_LEN : integer := 35;
     type rom35_t is array (0 to 34) of std_logic_vector(7 downto 0);
+    -- "\r\n=== GPS ACQUISITION RESULTS ===\r\n"
     constant HEADER : rom35_t := (
         x"0D", x"0A",
         x"3D", x"3D", x"3D", x"20",
@@ -141,12 +170,23 @@ architecture Behavioral of uart_reporter is
         x"0D", x"0A"
     );
 
-    function d2a(n : integer) return std_logic_vector is
+    -- nibble (0-15) -> ASCII hex character '0'..'9','A'..'F'
+    function n2h(nib : std_logic_vector(3 downto 0)) return std_logic_vector is
+        variable v : unsigned(3 downto 0);
     begin
-        return std_logic_vector(to_unsigned(n + 48, 8));
+        v := unsigned(nib);
+        if v < 10 then
+            return std_logic_vector(to_unsigned(48 + to_integer(v), 8));  -- '0'..'9'
+        else
+            return std_logic_vector(to_unsigned(55 + to_integer(v), 8));  -- 'A'..'F'
+        end if;
     end function;
 
 begin
+
+    assert NUM_PRNS <= 32
+        report "uart_reporter: NUM_PRNS > 32 no esta soportado"
+        severity note;
 
     u_uart : uart_tx
         generic map (CLK_FREQ => CLK_FREQ, BAUD_RATE => BAUD_RATE)
@@ -155,27 +195,27 @@ begin
                   tx_busy => tx_busy,  tx_pin   => uart_tx_pin);
 
     process(clk)
-        variable vi    : integer range 0 to 71;
-        variable dop_s : signed(7 downto 0);
-        variable dop_a : integer range 0 to 40960;
-        variable ph_v  : integer range 0 to 1023;
-        variable snr_v : integer range 0 to 65535;
-        variable prn_d : integer range 1 to 32;
-        variable cnt_v : integer range 0 to 63;
-        variable b     : buf72_t;
+        variable vi      : integer range 0 to 71;
+        variable b       : buf72_t;
+        variable tb      : buf32_t;
+        variable ti      : integer range 0 to 31;
+        variable prn1    : unsigned(5 downto 0);   -- PRN+1 (1-based, 6 bits)
+        variable dop_s   : std_logic;              -- sign bit of doppler
+        variable dop_abs : std_logic_vector(7 downto 0); -- abs(doppler)
     begin
         if rising_edge(clk) then
             tx_start_r <= '0';
 
-            -- -------------------------------------------------------
-            -- RESET HARDWARE (power-on / MMCM unlock)
-            -- Prioridad máxima.
-            -- -------------------------------------------------------
             if reset_n = '0' then
                 state       <= S_IDLE;
                 reporting   <= '0';
-                pending_wr  <= '0';
                 pending_snr <= (others => '0');
+                pending_nse <= (others => '0');
+                pending_mrg <= (others => '0');
+                pending_flg <= (others => '0');
+                fifo_wr_ptr <= 0;
+                fifo_rd_ptr <= 0;
+                fifo_count  <= 0;
                 report_pend <= '0';
                 sweep_pend  <= '0';
                 sat_cnt     <= (others => '0');
@@ -196,18 +236,25 @@ begin
                 end if;
 
                 -- -------------------------------------------------------
-                -- Latch wr_en: guarda el resultado de cada PRN.
-                -- sat_cnt se resetea en S_SEND_HDR, no aquí.
+                -- FIFO de resultados por PRN. Evita perdida de lineas si
+                -- llegan varios wr_en mientras UART sigue transmitiendo.
                 -- -------------------------------------------------------
                 if wr_en = '1' then
-                    pending_wr  <= '1';
-                    pending_prn <= wr_addr;
-                    pending_acq <= wr_acq;
-                    pending_dop <= wr_doppler;
-                    pending_ph  <= wr_phase;
-                    pending_snr <= wr_snr;
-                    if wr_acq = '1' then
-                        sat_cnt <= sat_cnt + 1;
+                    if fifo_count < FIFO_DEPTH then
+                        fifo_prn(fifo_wr_ptr) <= wr_addr;
+                        fifo_acq(fifo_wr_ptr) <= wr_acq;
+                        fifo_dop(fifo_wr_ptr) <= wr_doppler;
+                        fifo_ph (fifo_wr_ptr) <= wr_phase;
+                        fifo_snr(fifo_wr_ptr) <= wr_snr;
+                        fifo_nse(fifo_wr_ptr) <= wr_noise;
+                        fifo_mrg(fifo_wr_ptr) <= wr_margin;
+                        fifo_flg(fifo_wr_ptr) <= wr_flags;
+                        if fifo_wr_ptr = FIFO_DEPTH - 1 then
+                            fifo_wr_ptr <= 0;
+                        else
+                            fifo_wr_ptr <= fifo_wr_ptr + 1;
+                        end if;
+                        fifo_count <= fifo_count + 1;
                     end if;
                 end if;
 
@@ -224,13 +271,14 @@ begin
                         reporting   <= '0';
                         report_pend <= '0';
                         if force_reset = '1' then
-                            -- SW14=0: limpiar pendientes, no arrancar barrido.
                             sweep_pend <= '0';
                             sat_cnt    <= (others => '0');
-                            pending_wr <= '0';
-                        elsif sweep_pend = '1' or pending_wr = '1' then
+                            fifo_count <= 0;
+                            fifo_wr_ptr <= 0;
+                            fifo_rd_ptr <= 0;
+                        elsif sweep_pend = '1' or fifo_count > 0 then
                             sweep_pend <= '0';
-                            sat_cnt    <= (others => '0');  -- reset limpio
+                            sat_cnt    <= (others => '0');
                             hdr_idx    <= 0;
                             reporting  <= '1';
                             state      <= S_SEND_HDR;
@@ -248,114 +296,137 @@ begin
                         end if;
 
                     when S_WAIT_WR =>
-                        if pending_wr = '1' then
-                            pending_wr <= '0';
+                        if fifo_count > 0 then
+                            pending_prn <= fifo_prn(fifo_rd_ptr);
+                            pending_acq <= fifo_acq(fifo_rd_ptr);
+                            pending_dop <= fifo_dop(fifo_rd_ptr);
+                            pending_ph  <= fifo_ph (fifo_rd_ptr);
+                            pending_snr <= fifo_snr(fifo_rd_ptr);
+                            pending_nse <= fifo_nse(fifo_rd_ptr);
+                            pending_mrg <= fifo_mrg(fifo_rd_ptr);
+                            pending_flg <= fifo_flg(fifo_rd_ptr);
+                            if fifo_acq(fifo_rd_ptr) = '1' then
+                                sat_cnt <= sat_cnt + 1;
+                            end if;
+                            if fifo_rd_ptr = FIFO_DEPTH - 1 then
+                                fifo_rd_ptr <= 0;
+                            else
+                                fifo_rd_ptr <= fifo_rd_ptr + 1;
+                            end if;
+                            fifo_count <= fifo_count - 1;
                             state      <= S_FORMAT_SAT;
                         elsif report_pend = '1' then
                             report_pend <= '0';
                             state       <= S_FORMAT_TOTAL;
                         elsif force_reset = '1' then
-                            -- SW14 bajado: el adquisidor se reseteó y no
-                            -- mandará más wr_en ni acq_done. Enviar TOTAL
-                            -- con el parcial acumulado y cerrar el barrido.
                             state <= S_FORMAT_TOTAL;
                         end if;
 
                     when S_FORMAT_SAT =>
-                        vi    := 0;
-                        b     := lbuf;
-                        prn_d := to_integer(unsigned(pending_prn)) + 1;
-
-                        b(vi) := x"53"; vi := vi + 1;  -- S
-                        b(vi) := x"41"; vi := vi + 1;  -- A
-                        b(vi) := x"54"; vi := vi + 1;  -- T
+                        -- Build line in combinational variable, then latch to lbuf.
+                        -- ACQ  line: SAT XX: ACQ dop=SXX ph=XXX snr=XXXX n=XXXX m=XXXX f=XX\r\n
+                        -- NOLOCK   : SAT XX: NOLOCK n=XXXX m=XXXX f=XX\r\n
+                        b := (others => x"20");
+                        prn1    := unsigned('0' & pending_prn) + 1;
+                        dop_s   := pending_dop(7);
+                        if dop_s = '1' then
+                            dop_abs := std_logic_vector(unsigned(not pending_dop) + 1);
+                        else
+                            dop_abs := pending_dop;
+                        end if;
+                        vi := 0;
+                        b(vi) := x"53"; vi := vi + 1; -- S
+                        b(vi) := x"41"; vi := vi + 1; -- A
+                        b(vi) := x"54"; vi := vi + 1; -- T
                         b(vi) := x"20"; vi := vi + 1;
-                        b(vi) := d2a(prn_d / 10);   vi := vi + 1;
-                        b(vi) := d2a(prn_d mod 10); vi := vi + 1;
-                        b(vi) := x"3A"; vi := vi + 1;  -- :
+                        b(vi) := n2h("00" & std_logic_vector(prn1(5 downto 4))); vi := vi + 1;
+                        b(vi) := n2h(std_logic_vector(prn1(3 downto 0))); vi := vi + 1;
+                        b(vi) := x"3A"; vi := vi + 1;
                         b(vi) := x"20"; vi := vi + 1;
-
                         if pending_acq = '1' then
-                            b(vi) := x"41"; vi := vi + 1;  -- A
-                            b(vi) := x"43"; vi := vi + 1;  -- C
-                            b(vi) := x"51"; vi := vi + 1;  -- Q
-                            b(vi) := x"55"; vi := vi + 1;  -- U
-                            b(vi) := x"49"; vi := vi + 1;  -- I
-                            b(vi) := x"52"; vi := vi + 1;  -- R
-                            b(vi) := x"45"; vi := vi + 1;  -- E
-                            b(vi) := x"44"; vi := vi + 1;  -- D
+                            b(vi) := x"41"; vi := vi + 1; -- A
+                            b(vi) := x"43"; vi := vi + 1; -- C
+                            b(vi) := x"51"; vi := vi + 1; -- Q
                             b(vi) := x"20"; vi := vi + 1;
-                            b(vi) := x"20"; vi := vi + 1;
-                            b(vi) := x"64"; vi := vi + 1;  -- d
-                            b(vi) := x"6F"; vi := vi + 1;  -- o
-                            b(vi) := x"70"; vi := vi + 1;  -- p
-                            b(vi) := x"70"; vi := vi + 1;  -- p
-                            b(vi) := x"6C"; vi := vi + 1;  -- l
-                            b(vi) := x"65"; vi := vi + 1;  -- e
-                            b(vi) := x"72"; vi := vi + 1;  -- r
-                            b(vi) := x"3D"; vi := vi + 1;  -- =
-                            dop_s := signed(pending_dop);  -- FIX: sin negacion (bin>0 = Doppler positivo)
-                            if dop_s < 0 then
+                            b(vi) := x"64"; vi := vi + 1; -- d
+                            b(vi) := x"6F"; vi := vi + 1; -- o
+                            b(vi) := x"70"; vi := vi + 1; -- p
+                            b(vi) := x"3D"; vi := vi + 1;
+                            if dop_s = '1' then
                                 b(vi) := x"2D"; vi := vi + 1;  -- -
-                                dop_a := to_integer(-dop_s) * 320;
                             else
                                 b(vi) := x"2B"; vi := vi + 1;  -- +
-                                dop_a := to_integer(dop_s) * 320;
                             end if;
-                            b(vi) := d2a(dop_a / 10000);          vi := vi + 1;
-                            b(vi) := d2a((dop_a / 1000) mod 10);  vi := vi + 1;
-                            b(vi) := d2a((dop_a / 100)  mod 10);  vi := vi + 1;
-                            b(vi) := d2a((dop_a / 10)   mod 10);  vi := vi + 1;
-                            b(vi) := d2a(dop_a mod 10);           vi := vi + 1;
+                            b(vi) := n2h(dop_abs(7 downto 4)); vi := vi + 1;
+                            b(vi) := n2h(dop_abs(3 downto 0)); vi := vi + 1;
                             b(vi) := x"20"; vi := vi + 1;
-                            b(vi) := x"48"; vi := vi + 1;  -- H
-                            b(vi) := x"7A"; vi := vi + 1;  -- z
+                            b(vi) := x"70"; vi := vi + 1; -- p
+                            b(vi) := x"68"; vi := vi + 1; -- h
+                            b(vi) := x"3D"; vi := vi + 1;
+                            -- phase: 10 bits -> 3 nibbles: "00"&ph[9:8], ph[7:4], ph[3:0]
+                            b(vi) := n2h("00" & pending_ph(9 downto 8)); vi := vi + 1;
+                            b(vi) := n2h(pending_ph(7 downto 4)); vi := vi + 1;
+                            b(vi) := n2h(pending_ph(3 downto 0)); vi := vi + 1;
                             b(vi) := x"20"; vi := vi + 1;
+                            b(vi) := x"73"; vi := vi + 1; -- s
+                            b(vi) := x"6E"; vi := vi + 1; -- n
+                            b(vi) := x"72"; vi := vi + 1; -- r
+                            b(vi) := x"3D"; vi := vi + 1;
+                            b(vi) := n2h(pending_snr(15 downto 12)); vi := vi + 1;
+                            b(vi) := n2h(pending_snr(11 downto 8));  vi := vi + 1;
+                            b(vi) := n2h(pending_snr(7  downto 4));  vi := vi + 1;
+                            b(vi) := n2h(pending_snr(3  downto 0));  vi := vi + 1;
                             b(vi) := x"20"; vi := vi + 1;
-                            b(vi) := x"70"; vi := vi + 1;  -- p
-                            b(vi) := x"68"; vi := vi + 1;  -- h
-                            b(vi) := x"61"; vi := vi + 1;  -- a
-                            b(vi) := x"73"; vi := vi + 1;  -- s
-                            b(vi) := x"65"; vi := vi + 1;  -- e
-                            b(vi) := x"3D"; vi := vi + 1;  -- =
-                            ph_v := to_integer(unsigned(pending_ph));
-                            b(vi) := d2a(ph_v / 1000);          vi := vi + 1;
-                            b(vi) := d2a((ph_v / 100) mod 10);  vi := vi + 1;
-                            b(vi) := d2a((ph_v / 10)  mod 10);  vi := vi + 1;
-                            b(vi) := d2a(ph_v mod 10);          vi := vi + 1;
+                            b(vi) := x"6E"; vi := vi + 1; -- n
+                            b(vi) := x"3D"; vi := vi + 1;
+                            b(vi) := n2h(pending_nse(15 downto 12)); vi := vi + 1;
+                            b(vi) := n2h(pending_nse(11 downto 8));  vi := vi + 1;
+                            b(vi) := n2h(pending_nse(7  downto 4));  vi := vi + 1;
+                            b(vi) := n2h(pending_nse(3  downto 0));  vi := vi + 1;
                             b(vi) := x"20"; vi := vi + 1;
-                            b(vi) := x"63"; vi := vi + 1;  -- c
-                            b(vi) := x"68"; vi := vi + 1;  -- h
-                            b(vi) := x"69"; vi := vi + 1;  -- i
-                            b(vi) := x"70"; vi := vi + 1;  -- p
-                            b(vi) := x"73"; vi := vi + 1;  -- s
+                            b(vi) := x"6D"; vi := vi + 1; -- m
+                            b(vi) := x"3D"; vi := vi + 1;
+                            b(vi) := n2h(pending_mrg(15 downto 12)); vi := vi + 1;
+                            b(vi) := n2h(pending_mrg(11 downto 8));  vi := vi + 1;
+                            b(vi) := n2h(pending_mrg(7  downto 4));  vi := vi + 1;
+                            b(vi) := n2h(pending_mrg(3  downto 0));  vi := vi + 1;
                             b(vi) := x"20"; vi := vi + 1;
-                            b(vi) := x"20"; vi := vi + 1;
-                            b(vi) := x"73"; vi := vi + 1;  -- s
-                            b(vi) := x"6E"; vi := vi + 1;  -- n
-                            b(vi) := x"72"; vi := vi + 1;  -- r
-                            b(vi) := x"3D"; vi := vi + 1;  -- =
-                            snr_v := to_integer(unsigned(pending_snr));
-                            b(vi) := d2a(snr_v / 10000);          vi := vi + 1;
-                            b(vi) := d2a((snr_v / 1000) mod 10);  vi := vi + 1;
-                            b(vi) := d2a((snr_v / 100)  mod 10);  vi := vi + 1;
-                            b(vi) := d2a((snr_v / 10)   mod 10);  vi := vi + 1;
-                            b(vi) := d2a(snr_v mod 10);           vi := vi + 1;
-                            -- vi = 66
+                            b(vi) := x"66"; vi := vi + 1; -- f
+                            b(vi) := x"3D"; vi := vi + 1;
+                            b(vi) := n2h(pending_flg(7 downto 4));   vi := vi + 1;
+                            b(vi) := n2h(pending_flg(3 downto 0));   vi := vi + 1;
+                            b(vi) := x"0D"; vi := vi + 1;
+                            b(vi) := x"0A"; vi := vi + 1;
                         else
-                            b(vi) := x"4E"; vi := vi + 1;  -- N
-                            b(vi) := x"4F"; vi := vi + 1;  -- O
+                            -- NOLOCK
+                            b(vi) := x"4E"; vi := vi + 1; -- N
+                            b(vi) := x"4F"; vi := vi + 1; -- O
+                            b(vi) := x"4C"; vi := vi + 1; -- L
+                            b(vi) := x"4F"; vi := vi + 1; -- O
+                            b(vi) := x"43"; vi := vi + 1; -- C
+                            b(vi) := x"4B"; vi := vi + 1; -- K
                             b(vi) := x"20"; vi := vi + 1;
-                            b(vi) := x"4C"; vi := vi + 1;  -- L
-                            b(vi) := x"4F"; vi := vi + 1;  -- O
-                            b(vi) := x"43"; vi := vi + 1;  -- C
-                            b(vi) := x"4B"; vi := vi + 1;  -- K
-                            -- vi = 17
+                            b(vi) := x"6E"; vi := vi + 1; -- n
+                            b(vi) := x"3D"; vi := vi + 1;
+                            b(vi) := n2h(pending_nse(15 downto 12)); vi := vi + 1;
+                            b(vi) := n2h(pending_nse(11 downto 8));  vi := vi + 1;
+                            b(vi) := n2h(pending_nse(7  downto 4));  vi := vi + 1;
+                            b(vi) := n2h(pending_nse(3  downto 0));  vi := vi + 1;
+                            b(vi) := x"20"; vi := vi + 1;
+                            b(vi) := x"6D"; vi := vi + 1; -- m
+                            b(vi) := x"3D"; vi := vi + 1;
+                            b(vi) := n2h(pending_mrg(15 downto 12)); vi := vi + 1;
+                            b(vi) := n2h(pending_mrg(11 downto 8));  vi := vi + 1;
+                            b(vi) := n2h(pending_mrg(7  downto 4));  vi := vi + 1;
+                            b(vi) := n2h(pending_mrg(3  downto 0));  vi := vi + 1;
+                            b(vi) := x"20"; vi := vi + 1;
+                            b(vi) := x"66"; vi := vi + 1; -- f
+                            b(vi) := x"3D"; vi := vi + 1;
+                            b(vi) := n2h(pending_flg(7 downto 4));   vi := vi + 1;
+                            b(vi) := n2h(pending_flg(3 downto 0));   vi := vi + 1;
+                            b(vi) := x"0D"; vi := vi + 1;
+                            b(vi) := x"0A"; vi := vi + 1;
                         end if;
-
-                        b(vi) := x"0D"; vi := vi + 1;
-                        b(vi) := x"0A"; vi := vi + 1;
-
                         lbuf     <= b;
                         line_len <= vi;
                         line_idx <= 0;
@@ -373,35 +444,29 @@ begin
                         end if;
 
                     when S_FORMAT_TOTAL =>
-                        vi    := 0;
-                        b     := tbuf;
-                        cnt_v := to_integer(sat_cnt);
-                        b(vi) := x"54"; vi := vi + 1;  -- T
-                        b(vi) := x"4F"; vi := vi + 1;  -- O
-                        b(vi) := x"54"; vi := vi + 1;  -- T
-                        b(vi) := x"41"; vi := vi + 1;  -- A
-                        b(vi) := x"4C"; vi := vi + 1;  -- L
-                        b(vi) := x"3A"; vi := vi + 1;  -- :
-                        b(vi) := x"20"; vi := vi + 1;
-                        b(vi) := d2a(cnt_v / 10);   vi := vi + 1;
-                        b(vi) := d2a(cnt_v mod 10); vi := vi + 1;
-                        b(vi) := x"20"; vi := vi + 1;
-                        b(vi) := x"73"; vi := vi + 1;  -- s
-                        b(vi) := x"61"; vi := vi + 1;  -- a
-                        b(vi) := x"74"; vi := vi + 1;  -- t
-                        b(vi) := x"65"; vi := vi + 1;  -- e
-                        b(vi) := x"6C"; vi := vi + 1;  -- l
-                        b(vi) := x"6C"; vi := vi + 1;  -- l
-                        b(vi) := x"69"; vi := vi + 1;  -- i
-                        b(vi) := x"74"; vi := vi + 1;  -- t
-                        b(vi) := x"65"; vi := vi + 1;  -- e
-                        b(vi) := x"73"; vi := vi + 1;  -- s
-                        b(vi) := x"0D"; vi := vi + 1;
-                        b(vi) := x"0A"; vi := vi + 1;
-                        tbuf    <= b;
-                        tot_len <= vi;
+                        -- "TOTAL: XX sats\r\n" (hex sat count)
+                        tb := (others => x"20");
+                        ti := 0;
+                        tb(ti) := x"54"; ti := ti + 1; -- T
+                        tb(ti) := x"4F"; ti := ti + 1; -- O
+                        tb(ti) := x"54"; ti := ti + 1; -- T
+                        tb(ti) := x"41"; ti := ti + 1; -- A
+                        tb(ti) := x"4C"; ti := ti + 1; -- L
+                        tb(ti) := x"3A"; ti := ti + 1; -- :
+                        tb(ti) := x"20"; ti := ti + 1;
+                        tb(ti) := n2h("00" & std_logic_vector(sat_cnt(5 downto 4))); ti := ti + 1;
+                        tb(ti) := n2h(std_logic_vector(sat_cnt(3 downto 0))); ti := ti + 1;
+                        tb(ti) := x"20"; ti := ti + 1;
+                        tb(ti) := x"73"; ti := ti + 1; -- s
+                        tb(ti) := x"61"; ti := ti + 1; -- a
+                        tb(ti) := x"74"; ti := ti + 1; -- t
+                        tb(ti) := x"73"; ti := ti + 1; -- s
+                        tb(ti) := x"0D"; ti := ti + 1;
+                        tb(ti) := x"0A"; ti := ti + 1;
+                        tbuf    <= tb;
+                        tot_len <= ti;
                         tot_idx <= 0;
-                        state   <= S_SEND_TOTAL;
+                        state <= S_SEND_TOTAL;
 
                     when S_SEND_TOTAL =>
                         if tx_busy = '0' and tx_start_r = '0' then
@@ -429,13 +494,14 @@ begin
                     when S_DONE =>
                         reporting   <= '0';
                         report_pend <= '0';
-                        pending_wr  <= '0';
                         if force_reset = '1' then
-                            -- SW14=0: quedarse en S_IDLE sin relanzar barrido.
                             sweep_pend <= '0';
                             sat_cnt    <= (others => '0');
+                            fifo_count <= 0;
+                            fifo_wr_ptr <= 0;
+                            fifo_rd_ptr <= 0;
                             state      <= S_IDLE;
-                        elsif sweep_pend = '1' or pending_wr = '1' then
+                        elsif sweep_pend = '1' or fifo_count > 0 then
                             sweep_pend <= '0';
                             sat_cnt    <= (others => '0');
                             hdr_idx    <= 0;

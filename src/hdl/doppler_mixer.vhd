@@ -5,14 +5,15 @@ use IEEE.NUMERIC_STD.ALL;
 -- =============================================================
 -- doppler_mixer.vhd
 --
--- Demodulador IF + compensacion Doppler para señal 1-bit del
--- MAX2769C (Device State 2): IF = 4.092 MHz, Fs = 16.368 Msps,
--- decimada x16 → clk_en a ~1.023 MHz.
+-- Demodulador IF + compensacion Doppler para senal I-only
+-- sign-magnitude (2 bits) del MAX2769C (Device State 2):
+-- IF = 4.092 MHz, Fs = 16.368 Msps,
+-- decimada x16 -> clk_en a ~1.023 MHz.
 --
 -- PIPELINE (2 ciclos de latencia respecto a clk_en):
---   T0 (clk_en='1'): captura i1_in → bpsk_reg (+32767 / -32767)
---                    captura cos/sin del NCO   → cos_cap / sin_cap
---   T1              : producto registrado      → prod_I / prod_Q
+--   T0 (clk_en='1'): captura i1_sign/i0_mag -> bpsk_reg (+/-1, +/-2)
+--                    captura cos/sin del NCO   -> cos_cap / sin_cap
+--   T1              : producto registrado      -> prod_I / prod_Q
 --   rx_I/rx_Q       : estable desde T1 hasta proximo clk_en
 --
 -- NCO:
@@ -20,7 +21,7 @@ use IEEE.NUMERIC_STD.ALL;
 --     nco_inc = IF_INC + (doppler_sel + doppler_offset) * 54
 --   IF_INC = round(4.092e6/100e6 * 2^24) = 686421
 --   Factor 54: 1 bin Doppler (320 Hz) en acumulador 24b a 100 MHz
---              320/100e6 * 2^24 = 53.7 → 54
+--              320/100e6 * 2^24 = 53.7 -> 54
 -- =============================================================
 
 entity doppler_mixer is
@@ -28,7 +29,8 @@ entity doppler_mixer is
         clk            : in  STD_LOGIC;
         reset_n        : in  STD_LOGIC;
         clk_en         : in  STD_LOGIC;
-        i1_in          : in  STD_LOGIC;
+        i1_sign        : in  STD_LOGIC;
+        i0_mag         : in  STD_LOGIC;
         doppler_sel    : in  STD_LOGIC_VECTOR(7 downto 0);
         doppler_offset : in  STD_LOGIC_VECTOR(7 downto 0);
         rx_I           : out STD_LOGIC_VECTOR(15 downto 0);
@@ -114,6 +116,7 @@ architecture Behavioral of doppler_mixer is
 
     signal phase_accum : unsigned(23 downto 0) := (others => '0');
     signal nco_inc     : signed(24 downto 0)   := (others => '0');
+    signal dsum_r      : signed(8 downto 0)    := (others => '0');  -- etapa 0a pipeline
 
     signal bpsk_reg : signed(15 downto 0) := (others => '0');
     signal cos_cap  : signed(15 downto 0) := to_signed(32767, 16);
@@ -124,27 +127,37 @@ architecture Behavioral of doppler_mixer is
 
 begin
 
-    -- ── Etapa 0: calculo nco_inc ──────────────────────────────────────────
+    -- -- Etapa 0: calculo nco_inc (2 etapas registradas para mejor timing) --
+    -- Etapa 0a: suma doppler_sel + doppler_offset -> dsum_r (1 reg)
+    -- Etapa 0b: nco_inc = IF_INC + dsum_r * 54   -> nco_inc (1 reg)
+    --           x54 = x32 + x16 + x4 + x2  (sin DSP, solo shifts+sumas LUT)
     process(clk)
         variable dsel    : signed(8 downto 0);
         variable doffset : signed(8 downto 0);
-        variable dsum    : signed(8 downto 0);
-        variable dop_inc : signed(15 downto 0);
+        variable ds25    : signed(24 downto 0);
+        variable dop_inc : signed(24 downto 0);
     begin
         if rising_edge(clk) then
             if reset_n = '0' then
+                dsum_r  <= (others => '0');
                 nco_inc <= IF_INC;
             else
-                dsel    := resize(signed(doppler_sel),    9);
+                -- Etapa 0a: registrar suma Doppler
+                dsel   := resize(signed(doppler_sel),    9);
                 doffset := resize(signed(doppler_offset), 9);
-                dsum    := dsel + doffset;
-                dop_inc := resize(dsum * to_signed(54, 7), 16);
-                nco_inc <= IF_INC + resize(dop_inc, 25);
+                dsum_r <= dsel + doffset;
+                -- Etapa 0b: multiply by 54 = 32+16+4+2, todo en 25 bits
+                ds25    := resize(dsum_r, 25);
+                dop_inc := shift_left(ds25, 5) +   -- *32
+                           shift_left(ds25, 4) +   -- *16
+                           shift_left(ds25, 2) +   -- *4
+                           shift_left(ds25, 1);    -- *2
+                nco_inc <= IF_INC + dop_inc;
             end if;
         end if;
     end process;
 
-    -- ── Etapa 1: NCO (100 MHz) + captura señal y portadora en clk_en ─────
+    -- -- Etapa 1: NCO (100 MHz) + captura senal y portadora en clk_en -----
     process(clk)
         variable new_phase : unsigned(24 downto 0);
     begin
@@ -158,10 +171,21 @@ begin
                 new_phase   := ('0' & phase_accum) + unsigned(resize(nco_inc, 25));
                 phase_accum <= new_phase(23 downto 0);
                 if clk_en = '1' then
-                    if i1_in = '1' then
-                        bpsk_reg <= to_signed( 32767, 16);
+                    -- Sign-magnitude MAX2769C:
+                    -- i1_sign=0 positivo, i1_sign=1 negativo
+                    -- i0_mag =0 debil (1), i0_mag =1 fuerte (2)
+                    if i1_sign = '0' then
+                        if i0_mag = '1' then
+                            bpsk_reg <= to_signed(32767, 16);   -- +2
+                        else
+                            bpsk_reg <= to_signed(16384, 16);   -- +1
+                        end if;
                     else
-                        bpsk_reg <= to_signed(-32767, 16);
+                        if i0_mag = '1' then
+                            bpsk_reg <= to_signed(-32767, 16);  -- -2
+                        else
+                            bpsk_reg <= to_signed(-16384, 16);  -- -1
+                        end if;
                     end if;
                     cos_cap <= cos_lut(to_integer(new_phase(23 downto 16)));
                     sin_cap <= sin_lut(to_integer(new_phase(23 downto 16)));
@@ -170,7 +194,7 @@ begin
         end if;
     end process;
 
-    -- ── Etapa 2: multiplicacion registrada ───────────────────────────────
+    -- -- Etapa 2: multiplicacion registrada -------------------------------
     process(clk)
     begin
         if rising_edge(clk) then

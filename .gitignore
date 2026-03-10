@@ -6,6 +6,9 @@
 *.sim/
 *.gen/
 
+# Entorno virtual Python
+.venv/
+
 # Ignorar archivos de log y journal
 *.log
 *.jou
@@ -13,3 +16,13 @@
 
 # Ignorar archivos de backup
 *.backup*
+
+# Archivos residuales de Vivado en la raiz del repo
+.Xil/
+dfx_runtime.txt
+
+# Proyecto Vivado generado (runs, .xpr y derivados)
+vivado/
+
+# Bitstream de salida (binario grande)
+artifacts/*.bit

@@ -1,13 +1,8 @@
 [main]
 standard = "1993"
 
-[libraries.ieee]
+[libraries.defaultlib]
 files = [
-  "C:/Xilinx/2025.1/data/vhdl/src/ieee/distributable/*.vhd"
-]
-
-[libraries.work]
-files = [
+  "src/hdl/gps_config_pkg.vhd",
   "src/hdl/*.vhd",
-  "src/ip/**/*.vhd"
 ]

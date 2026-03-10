@@ -5,13 +5,15 @@ use IEEE.NUMERIC_STD.ALL;
 -- =============================================================
 -- multi_sat_rx_gen.vhd
 --
--- Generador sintetico de señal GPS L1 C/A, replica el formato
--- del MAX2769C (Device State 2): 1 bit CMOS, IF=4.092 MHz,
+-- Generador sintetico de senal GPS L1 C/A, replica el formato
+-- del MAX2769C (Device State 2): I-only sign-magnitude (I1/I0),
+-- IF=4.092 MHz,
 -- Fs=16.368 Msps.
 --
 -- Hasta 3 satelites en paralelo. Cada satelite genera:
 --   BPSK( CA_N(t - phase_N), IF + doppler_N )
--- La señal compuesta se cuantiza a 1 bit (signo de la suma).
+-- La senal compuesta se cuantiza en 2 bits sign-magnitude:
+--   I1 = signo (0:+, 1:-), I0 = magnitud (0:debil, 1:fuerte).
 --
 -- SINCRONISMO:
 --   clk_en      : avance del CA (= clk_en_fe del top)
@@ -19,7 +21,7 @@ use IEEE.NUMERIC_STD.ALL;
 --
 -- NCO portadora por satelite (avanza en clk_en_samp = sample_en_samp ~16.368 MHz):
 --   inc_N = IF_INC + doppler_bins_N * DOP_FACTOR
---   El NCO avanza con clk_en_samp='1' → cada ciclo de 100 MHz (igual que el mixer)
+--   El NCO avanza con clk_en_samp='1' -> cada ciclo de 100 MHz (igual que el mixer)
 --   IF_INC     = round(4.092e6 / 100e6 * 2^24) = 686421  [igual que doppler_mixer]
 --   DOP_FACTOR = round(320 / 100e6 * 2^24) = 54           [pero valor en codigo: 54]
 -- =============================================================
@@ -34,16 +36,19 @@ entity multi_sat_rx_gen is
         sat1_prn     : in  STD_LOGIC_VECTOR(4 downto 0);
         sat1_doppler : in  STD_LOGIC_VECTOR(7 downto 0);
         sat1_phase   : in  STD_LOGIC_VECTOR(9 downto 0);
+        sat1_gain    : in  STD_LOGIC_VECTOR(2 downto 0);
         sat1_en      : in  STD_LOGIC;
 
         sat2_prn     : in  STD_LOGIC_VECTOR(4 downto 0);
         sat2_doppler : in  STD_LOGIC_VECTOR(7 downto 0);
         sat2_phase   : in  STD_LOGIC_VECTOR(9 downto 0);
+        sat2_gain    : in  STD_LOGIC_VECTOR(2 downto 0);
         sat2_en      : in  STD_LOGIC;
 
         sat3_prn     : in  STD_LOGIC_VECTOR(4 downto 0);
         sat3_doppler : in  STD_LOGIC_VECTOR(7 downto 0);
         sat3_phase   : in  STD_LOGIC_VECTOR(9 downto 0);
+        sat3_gain    : in  STD_LOGIC_VECTOR(2 downto 0);
         sat3_en      : in  STD_LOGIC;
 
         i1_out    : out STD_LOGIC;
@@ -68,17 +73,27 @@ architecture Behavioral of multi_sat_rx_gen is
     signal cnt1, cnt2, cnt3       : unsigned(9 downto 0) := (others => '0');
     signal pdone1, pdone2, pdone3 : std_logic := '0';
 
-    -- NCO portadora avanza con clk_en_samp='1' → 100 MHz, igual que el doppler_mixer.
-    -- IF_INC = 686421: portadora a 4.092 MHz a 100 MHz (identico al mixer → correlacion maxima)
-    -- DOP_FACTOR = 54: 1 bin Doppler = 320 Hz a 100 MHz (320/100e6 * 2^24 = 53.7 ≈ 54)
+    -- NCO portadora avanza con clk_en_samp='1' -> 100 MHz, igual que el doppler_mixer.
+    -- IF_INC = 686421: portadora a 4.092 MHz a 100 MHz (identico al mixer -> correlacion maxima)
+    -- DOP_FACTOR = 54: 1 bin Doppler = 320 Hz a 100 MHz (320/100e6 * 2^24 = 53.7 ~ 54)
     constant IF_INC    : unsigned(23 downto 0) := to_unsigned(686421, 24);
-    constant DOP_FACTOR: integer               := 54;
 
     signal ph1, ph2, ph3             : unsigned(23 downto 0) := (others => '0');
     signal carrier1, carrier2, carrier3 : std_logic := '0';
 
     signal bpsk1, bpsk2, bpsk3 : std_logic := '0';
-    signal rx_combined          : std_logic := '0';
+    signal rx_sign              : std_logic := '0';
+    signal rx_mag               : std_logic := '0';
+
+    -- x*54 = x*(32+16+4+2), implementado con shifts para evitar mult entero.
+    function mul_doppler54(x : signed(7 downto 0)) return signed is
+        variable x24 : signed(23 downto 0);
+        variable y24 : signed(23 downto 0);
+    begin
+        x24 := resize(x, 24);
+        y24 := shift_left(x24, 5) + shift_left(x24, 4) + shift_left(x24, 2) + shift_left(x24, 1);
+        return y24;
+    end function;
 
 begin
 
@@ -109,15 +124,16 @@ begin
                 if unsigned(sat3_phase) = 0 then pdone3 <= '1'; end if;
             elsif clk_en = '1' then
                 if pdone1 = '0' then
-                    if cnt1 >= unsigned(sat1_phase) - 1 then pdone1 <= '1';
+                    -- phase=0 implica sin retardo; evitar underflow en (phase-1)
+                    if unsigned(sat1_phase) = 0 or cnt1 >= unsigned(sat1_phase) - 1 then pdone1 <= '1';
                     else cnt1 <= cnt1 + 1; end if;
                 end if;
                 if pdone2 = '0' then
-                    if cnt2 >= unsigned(sat2_phase) - 1 then pdone2 <= '1';
+                    if unsigned(sat2_phase) = 0 or cnt2 >= unsigned(sat2_phase) - 1 then pdone2 <= '1';
                     else cnt2 <= cnt2 + 1; end if;
                 end if;
                 if pdone3 = '0' then
-                    if cnt3 >= unsigned(sat3_phase) - 1 then pdone3 <= '1';
+                    if unsigned(sat3_phase) = 0 or cnt3 >= unsigned(sat3_phase) - 1 then pdone3 <= '1';
                     else cnt3 <= cnt3 + 1; end if;
                 end if;
             end if;
@@ -140,9 +156,9 @@ begin
                 ph3 <= (others => '0');
                 carrier1 <= '0'; carrier2 <= '0'; carrier3 <= '0';
             elsif clk_en_samp = '1' then
-                inc1_v := to_signed(to_integer(signed(sat1_doppler)) * DOP_FACTOR, 24);
-                inc2_v := to_signed(to_integer(signed(sat2_doppler)) * DOP_FACTOR, 24);
-                inc3_v := to_signed(to_integer(signed(sat3_doppler)) * DOP_FACTOR, 24);
+                inc1_v := mul_doppler54(signed(sat1_doppler));
+                inc2_v := mul_doppler54(signed(sat2_doppler));
+                inc3_v := mul_doppler54(signed(sat3_doppler));
 
                 next1 := ('0' & ph1) + ('0' & IF_INC) + unsigned(resize(inc1_v, 25));
                 next2 := ('0' & ph2) + ('0' & IF_INC) + unsigned(resize(inc2_v, 25));
@@ -159,45 +175,61 @@ begin
         end if;
     end process;
 
-    -- BPSK: CA xor portadora (ca=0 → +1 sin invertir, ca=1 → -1 invierte)
+    -- BPSK: CA xor portadora (ca=0 -> +1 sin invertir, ca=1 -> -1 invierte)
     bpsk1 <= ca1 xor carrier1;
     bpsk2 <= ca2 xor carrier2;
     bpsk3 <= ca3 xor carrier3;
 
-    -- Composicion: signo de la suma de señales activas (cuantizacion 1 bit)
+    -- Composicion ponderada: signo de suma de satelites activos.
+    -- Cada satelite aporta +/-GAIN segun su bit BPSK para modelar
+    -- desbalance de potencias real (evita cancelacion fuerte en 1-bit).
     process(clk)
-        variable s : integer range 0 to 3;
+        variable acc : integer range -63 to 63;
+        variable g1, g2, g3 : integer range 0 to 7;
     begin
         if rising_edge(clk) then
             if reset = '1' then
-                rx_combined <= '0';
+                rx_sign <= '0';
+                rx_mag  <= '0';
             else
-                s := 0;
-                if sat1_en = '1' and bpsk1 = '1' then s := s + 1; end if;
-                if sat2_en = '1' and bpsk2 = '1' then s := s + 1; end if;
-                if sat3_en = '1' and bpsk3 = '1' then s := s + 1; end if;
+                acc := 0;
+                g1 := to_integer(unsigned(sat1_gain));
+                g2 := to_integer(unsigned(sat2_gain));
+                g3 := to_integer(unsigned(sat3_gain));
 
-                if    sat1_en = '1' and sat2_en = '1' and sat3_en = '1' then
-                    -- 3 sats: mayoria de votos
-                    if s >= 2 then rx_combined <= '1'; else rx_combined <= '0'; end if;
-                elsif sat1_en = '1' and sat2_en = '1' then
-                    -- 2 sats: sat1 desempata
-                    rx_combined <= bpsk1;
-                elsif sat1_en = '1' and sat3_en = '1' then
-                    rx_combined <= bpsk1;
-                elsif sat2_en = '1' and sat3_en = '1' then
-                    rx_combined <= bpsk2;
-                elsif sat1_en = '1' then rx_combined <= bpsk1;
-                elsif sat2_en = '1' then rx_combined <= bpsk2;
-                elsif sat3_en = '1' then rx_combined <= bpsk3;
-                else                     rx_combined <= '0';
+                if sat1_en = '1' then
+                    if bpsk1 = '1' then acc := acc + g1; else acc := acc - g1; end if;
+                end if;
+                if sat2_en = '1' then
+                    if bpsk2 = '1' then acc := acc + g2; else acc := acc - g2; end if;
+                end if;
+                if sat3_en = '1' then
+                    if bpsk3 = '1' then acc := acc + g3; else acc := acc - g3; end if;
+                end if;
+
+                -- Umbral de magnitud fuerte adaptado a la potencia activa.
+                if (sat1_en = '0' and sat2_en = '0' and sat3_en = '0') then
+                    rx_sign <= '0';
+                    rx_mag  <= '0';
+                else
+                    if acc < 0 then
+                        rx_sign <= '1';
+                    else
+                        rx_sign <= '0';
+                    end if;
+
+                    if (abs(acc) * 2) >= (g1 + g2 + g3) then
+                        rx_mag <= '1';
+                    else
+                        rx_mag <= '0';
+                    end if;
                 end if;
             end if;
         end if;
     end process;
 
-    i1_out <= rx_combined;
-    i0_out <= not rx_combined;
-    rx_out <= rx_combined;
+    i1_out <= rx_sign;
+    i0_out <= rx_mag;
+    rx_out <= not rx_sign;
 
 end Behavioral;

@@ -7,19 +7,19 @@
 ##   led[2:0]     -> LEDs
 ##   seg[6:0]     -> segmentos del display
 ##   an[3:0]      -> ánodos del display
-##   i1_real      -> I1 del MAX2769C (señal activa,  CMOS 3.3V, 16.368 MSPS)
-##   i0_real      -> I0 del MAX2769C (señal pasiva,  CMOS 3.3V, diferencial)
+##   i1_real      -> I1 del MAX2769C (bit de signo, CMOS 3.3V, 16.368 MSPS)
+##   i0_real      -> I0 del MAX2769C (bit de magnitud, CMOS 3.3V, 16.368 MSPS)
 ##
 ## Mapa de switches:
 ##   sw[4:0]   = PRN satélite local (Satélite = sw[4:0] + 1)
 ##   sw[5]     = modo señal: 0 = front-end real, 1 = señal sintética
 ##   sw[13:6]  = Doppler offset en complemento a 2 (pasos de 320 Hz)
 ##   sw[14]    = activa barrido automático (flanco subida = inicia barrido)
-##   sw[15]    = modo display (0 = bin Doppler, 1 = PRN actual)
+##   sw[15]    = modo display (auto: 0 = bin Doppler, 1 = PRN; manual: 0 = PRN, 1 = fase)
 ##
 ## Conexión del MAX2769C (CLK OUT) a la Basys 3:
-##   MAX2769C I1 (activa)  -> Pmod JA pin 1  (FPGA: J1)
-##   MAX2769C I0 (pasiva)  -> Pmod JA pin 2  (FPGA: L2)
+##   MAX2769C I1 (signo)   -> Pmod JA pin 3  (FPGA: J2)
+##   MAX2769C I0 (magnitud)-> Pmod JA pin 4  (FPGA: G2)
 ##   MAX2769C GND          -> Pmod JA pin 5  (GND)
 ##   MAX2769C VCC (3.3V)   -> Pmod JA pin 6  (VCC)
 ##
@@ -34,7 +34,6 @@
 ## Reloj 100 MHz
 set_property PACKAGE_PIN W5  [get_ports clk]
 set_property IOSTANDARD LVCMOS33 [get_ports clk]
-create_clock -add -name sys_clk_pin -period 10.00 -waveform {0 5} [get_ports clk]
 
 ## Switches sw[15:0]
 set_property PACKAGE_PIN V17 [get_ports {sw[0]}]
@@ -119,7 +118,3 @@ set_property IOSTANDARD LVCMOS33 [get_ports i1_real]
 set_property PACKAGE_PIN G2  [get_ports i0_real]
 set_property IOSTANDARD LVCMOS33 [get_ports i0_real]
 
-## Timing: las entradas del front-end son asíncronas respecto al reloj del FPGA.
-## Se declaran false paths porque el diseño ya tiene doble flip-flop de sincronización.
-set_false_path -from [get_ports i1_real]
-set_false_path -from [get_ports i0_real]

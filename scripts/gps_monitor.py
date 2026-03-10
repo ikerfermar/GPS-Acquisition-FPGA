@@ -4,7 +4,7 @@ GPS Acquisition Live Monitor  —  Basys-3 UART
 ==============================================
 Dos ventanas:
   Ventana 1: barras en tiempo real, 1 barra por PRN, actualización PRN a PRN.
-             Eje Y = SNR proxy (prn_best_accum >> 8), permite comparar
+             Eje Y = SNR proxy (prn_best_accum >> 4), permite comparar
              intensidad de señal entre satélites adquiridos.
   Ventana 2: métricas de debugging (historial, varianza, tasa detección, etc.)
 
@@ -21,6 +21,11 @@ Dependencias:
 Formato UART esperado (v13 firmware):
   SAT XX: ACQUIRED  doppler=±NNNNN Hz  phase=NNNN chips  snr=NNNNN
   SAT XX: NO LOCK
+
+Formato HEX v12 firmware (sin prefijo 0x, 'sats'):
+    SAT PP: ACQ dop=SDD ph=PPP snr=SSSS
+    SAT PP: NOLOCK
+    TOTAL: TT sats
 
 Etiquetas encima de cada barra: Doppler (kHz) y Code Phase (chips).
 El eje Y muestra el SNR proxy (adim. = adimensional, escala interna FPGA).
@@ -93,6 +98,15 @@ RE_ACQ    = re.compile(
 )
 RE_NOLOCK = re.compile(r'SAT\s+(\d+):\s+NO LOCK')
 RE_TOTAL  = re.compile(r'TOTAL:\s+(\d+)\s+satellites')
+# v12 firmware hex format: SAT XX: ACQ dop=SXX ph=XXX snr=XXXX  (no 0x prefix)
+RE_ACQ_HEX = re.compile(
+    r'SAT\s+([0-9A-Fa-f]{2}):\s+ACQ\s+dop=([+-])([0-9A-Fa-f]{2})\s+ph=([0-9A-Fa-f]{3})\s+snr=([0-9A-Fa-f]{4})'
+    r'(?:\s+n=([0-9A-Fa-f]{4})\s+m=([0-9A-Fa-f]{4})\s+f=([0-9A-Fa-f]{2}))?'
+)
+RE_NOLOCK_HEX = re.compile(
+    r'SAT\s+([0-9A-Fa-f]{2}):\s+NOLOCK(?:\s+n=([0-9A-Fa-f]{4})\s+m=([0-9A-Fa-f]{4})\s+f=([0-9A-Fa-f]{2}))?'
+)
+RE_TOTAL_HEX  = re.compile(r'TOTAL:\s+([0-9A-Fa-f]{2})\s+sats')
 RE_HDR    = re.compile(r'=== GPS ACQUISITION RESULTS ===')
 RE_FTR    = re.compile(r'^={10,}$')
 
@@ -138,6 +152,10 @@ class State:
         line = raw.strip()
         if not line:
             return
+
+        def s8_from_hex(h2):
+            v = int(h2, 16)
+            return v - 256 if v >= 128 else v
 
         if RE_HDR.match(line):
             with self.lock:
@@ -191,6 +209,31 @@ class State:
                 self.scanning.discard(prn)
             return
 
+        m = RE_ACQ_HEX.match(line)
+        if m:
+            prn     = int(m.group(1), 16)
+            # v12/v13 hex format:
+            # group(2)=sign(+/-), group(3)=magnitude hex, group(4)=phase, group(5)=snr
+            # group(6..8)=optional n/m/f debug telemetry
+            dop_mag = int(m.group(3), 16)
+            dop_bin = dop_mag if m.group(2) == '+' else -dop_mag
+            dop     = dop_bin * 320
+            phase   = int(m.group(4), 16)
+            snr     = int(m.group(5), 16)
+            noise   = int(m.group(6), 16) if m.group(6) is not None else 0
+            margin  = int(m.group(7), 16) if m.group(7) is not None else 0
+            flags   = int(m.group(8), 16) if m.group(8) is not None else 0
+            with self.lock:
+                self.last_ts = time.time()
+                d = {'acquired': True, 'doppler': dop,
+                     'phase': phase, 'snr': snr,
+                     'noise': noise, 'margin': margin, 'flags': flags,
+                     'ts': time.time()}
+                self.live[prn] = d
+                self._cur[prn] = d
+                self.scanning.discard(prn)
+            return
+
         m = RE_NOLOCK.match(line)
         if m:
             prn = int(m.group(1))
@@ -203,10 +246,33 @@ class State:
                 self.scanning.discard(prn)
             return
 
+        m = RE_NOLOCK_HEX.match(line)
+        if m:
+            prn = int(m.group(1), 16)
+            noise = int(m.group(2), 16) if m.group(2) is not None else 0
+            margin = int(m.group(3), 16) if m.group(3) is not None else 0
+            flags = int(m.group(4), 16) if m.group(4) is not None else 0
+            with self.lock:
+                self.last_ts = time.time()
+                d = {'acquired': False, 'doppler': 0,
+                     'phase': 0, 'snr': 0,
+                     'noise': noise, 'margin': margin, 'flags': flags,
+                     'ts': time.time()}
+                self.live[prn] = d
+                self._cur[prn] = d
+                self.scanning.discard(prn)
+            return
+
         m = RE_TOTAL.match(line)
         if m:
             with self.lock:
                 self.total_sats = int(m.group(1))
+            return
+
+        m = RE_TOTAL_HEX.match(line)
+        if m:
+            with self.lock:
+                self.total_sats = int(m.group(1), 16)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -236,31 +302,33 @@ def serial_reader(port, baud, state, stop):
 def demo_thread(state, stop, num_prns):
     # PRN→(doppler_Hz, phase_chips, snr_base)
     # snr distintos para mostrar diferencia de potencia entre sats
+    # PRN → (doppler_bin, phase_chips, snr_base)
+    # doppler_bin * 320 Hz = Doppler Hz; bin+8=+2560 Hz, bin-12=-3840 Hz, bin+16=+5120 Hz
     SAT = {
-        1: (6400,   100, 4800),   # señal fuerte
-        2: (-9600,  300, 2200),   # señal media
-        3: (19200,  600, 900),    # señal débil (pero por encima del umbral)
+        1: (+8,    100, 0x1D40),   # señal fuerte
+        2: (-12,   300, 0x0FB3),   # señal media
+        3: (+16,   600, 0x0CD0),   # señal débil (pero por encima del umbral)
     }
     state.port_status = 'ok'
-    state.status_msg  = 'DEMO (sin hardware)'
+    state.status_msg  = 'DEMO (sin hardware) — formato v12 HEX'
     while not stop.is_set():
         state.on_line("=== GPS ACQUISITION RESULTS ===")
         for p in range(1, num_prns + 1):
             time.sleep(0.15)
             if p in SAT:
-                d, ph, snr_base = SAT[p]
-                d   += random.randint(-320, 320)
-                ph  += random.randint(-1, 1)
-                snr  = snr_base + random.randint(-snr_base // 10,
-                                                  snr_base // 10)
-                snr  = max(0, snr)
+                dbin, ph, snr_base = SAT[p]
+                dbin += random.randint(-1, 1)
+                ph   += random.randint(-1, 1)
+                snr   = snr_base + random.randint(-snr_base // 10,
+                                                   snr_base // 10)
+                snr   = max(0, snr) & 0xFFFF
+                sign  = '+' if dbin >= 0 else '-'
                 state.on_line(
-                    f"SAT {p:02d}: ACQUIRED  "
-                    f"doppler={d:+06d} Hz  phase={ph:04d} chips  "
-                    f"snr={snr:05d}")
+                    f"SAT {p:02X}: ACQ dop={sign}{abs(dbin):02X} "
+                    f"ph={ph:03X} snr={snr:04X}")
             else:
-                state.on_line(f"SAT {p:02d}: NO LOCK")
-        state.on_line(f"TOTAL: {len(SAT):02d} satellites")
+                state.on_line(f"SAT {p:02X}: NOLOCK")
+        state.on_line(f"TOTAL: {len(SAT):02X} sats")
         state.on_line("=" * 32)
         time.sleep(0.3)
 
@@ -627,7 +695,7 @@ def main():
     ap.add_argument('--port',      '-p', default=None,
                     help='Puerto serie (COM3 o /dev/ttyUSB1)')
     ap.add_argument('--baud',      '-b', type=int, default=115200)
-    ap.add_argument('--prns',      '-n', type=int, default=8,
+    ap.add_argument('--prns',      '-n', type=int, default=32,
                     help='Número de PRNs en la FPGA')
     ap.add_argument('--interval',  '-i', type=int, default=400,
                     help='Refresco ventana live (ms)')

@@ -9,8 +9,8 @@ use IEEE.NUMERIC_STD.ALL;
 -- |re| + |im|), encuentra el pico y calcula el nivel de ruido:
 --   noise_floor = (suma_total - peak_val) >> 10
 --               = media de las 1023 muestras no-pico
--- noise_floor tiene un minimo de 1 para evitar que K*noise=0
--- deje pasar cualquier señal en el CFAR.
+-- El clamp a minimo=1 se aplica en acquisition_controller para
+-- aliviar timing en esta ruta critica.
 -- =============================================================
 
 entity peak_detector is
@@ -96,15 +96,8 @@ begin
                     end if;
 
                     -- noise_floor = (suma_total - peak_val) / 1024
-                    -- Mínimo forzado a 1: si noise_sum=0 (pico perfecto),
-                    -- noise_floor=0 haría que K*noise_floor=0 y cualquier
-                    -- señal pasara el CFAR. Con mínimo=1 se evita.
                     noise_sum := v_sum - v_max;
-                    if noise_sum(25 downto 10) = x"0000" then
-                        noise_floor_reg <= x"0001";
-                    else
-                        noise_floor_reg <= std_logic_vector(noise_sum(25 downto 10));
-                    end if;
+                    noise_floor_reg <= std_logic_vector(noise_sum(25 downto 10));
 
                     -- Reset para el siguiente frame
                     current_max    <= (others => '0');
