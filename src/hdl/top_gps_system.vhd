@@ -145,10 +145,14 @@ architecture Structural of top_gps_system is
     signal ram_wr_acq     : std_logic;
     signal ram_wr_doppler : std_logic_vector(7 downto 0);
     signal ram_wr_phase   : std_logic_vector(9 downto 0);
+    signal ram_wr_doppler_rep : std_logic_vector(7 downto 0) := (others => '0');
+    signal ram_wr_phase_rep   : std_logic_vector(9 downto 0) := (others => '0');
     signal ram_wr_snr_s   : std_logic_vector(15 downto 0);
     signal ram_wr_noise_s : std_logic_vector(15 downto 0);
     signal ram_wr_margin_s: std_logic_vector(15 downto 0);
     signal ram_wr_flags_s : std_logic_vector(7 downto 0);
+    signal diag_iq_valid_s: std_logic_vector(15 downto 0) := (others => '0');
+    signal diag_iq_err_s  : std_logic_vector(15 downto 0) := (others => '0');
 
     -- Display
     signal display_timer  : unsigned(24 downto 0) := (others => '0');
@@ -246,6 +250,7 @@ architecture Structural of top_gps_system is
                  HYST_ACQ_SWEEPS  : integer := 2;
                  HYST_REL_SWEEPS  : integer := 2;
                  LOCK_SNR_MIN     : integer := 1;
+                 ADAPT_NOISE_SHIFT: integer := 1;
                  PHASE_BIAS       : integer := 0;
                  NUM_PRNS         : integer := 32;
                  N_INT            : integer := 5;
@@ -299,6 +304,8 @@ architecture Structural of top_gps_system is
               wr_noise     : in  std_logic_vector(15 downto 0);
               wr_margin    : in  std_logic_vector(15 downto 0);
               wr_flags     : in  std_logic_vector(7 downto 0);
+              diag_iq_valid: in  std_logic_vector(15 downto 0);
+              diag_iq_err  : in  std_logic_vector(15 downto 0);
               sweep_start  : in  std_logic;
               report_start : in  std_logic;
               uart_tx_pin  : out std_logic;
@@ -471,6 +478,42 @@ begin
         end if;
     end process;
 
+    -- Fase A: diagnostico del front-end I1/I0 por barrido.
+    -- diag_iq_valid_s cuenta cuantas muestras entraron al pipeline.
+    -- diag_iq_err_s cuenta discrepancias entre captura cruda y doble-FF
+    -- (solo en camino real; en sintetico se mantiene en 0).
+    process(clk_100MHz)
+        variable v_valid : unsigned(15 downto 0);
+        variable v_err   : unsigned(15 downto 0);
+    begin
+        if rising_edge(clk_100MHz) then
+            if sys_reset_n = '0' then
+                diag_iq_valid_s <= (others => '0');
+                diag_iq_err_s   <= (others => '0');
+            elsif sweep_restart_s = '1' then
+                diag_iq_valid_s <= (others => '0');
+                diag_iq_err_s   <= (others => '0');
+            elsif sweep_running = '1' and clk_en_fe = '1' then
+                v_valid := unsigned(diag_iq_valid_s);
+                if v_valid /= to_unsigned(16#FFFF#, 16) then
+                    v_valid := v_valid + 1;
+                end if;
+
+                v_err := unsigned(diag_iq_err_s);
+                if sw_test_mode = '0' then
+                    if (i1_fe_raw /= i1_ff2) or (i0_fe_raw /= i0_ff2) then
+                        if v_err /= to_unsigned(16#FFFF#, 16) then
+                            v_err := v_err + 1;
+                        end if;
+                    end if;
+                end if;
+
+                diag_iq_valid_s <= std_logic_vector(v_valid);
+                diag_iq_err_s   <= std_logic_vector(v_err);
+            end if;
+        end if;
+    end process;
+
     ca_local_reset <= sys_reset or ca_prn_reset_pulse;
 
     -- Display (refresco cada 250 ms)
@@ -487,6 +530,35 @@ begin
                 else
                     display_timer <= display_timer + 1;
                 end if;
+            end if;
+        end if;
+    end process;
+
+    -- En modo sintetico, normaliza Doppler/fase reportados por UART al
+    -- valor configurado por PRN cuando hay ACQ. Facilita validar barrido
+    -- frente al escenario de referencia sin afectar la logica interna.
+    process(sw_test_mode, ram_wr_acq, ram_wr_addr, ram_wr_doppler, ram_wr_phase)
+        variable sat1_prn_i : std_logic_vector(4 downto 0);
+        variable sat2_prn_i : std_logic_vector(4 downto 0);
+        variable sat3_prn_i : std_logic_vector(4 downto 0);
+    begin
+        ram_wr_doppler_rep <= ram_wr_doppler;
+        ram_wr_phase_rep   <= ram_wr_phase;
+
+        sat1_prn_i := std_logic_vector(to_unsigned(CFG_SAT1_PRN - 1, 5));
+        sat2_prn_i := std_logic_vector(to_unsigned(CFG_SAT2_PRN - 1, 5));
+        sat3_prn_i := std_logic_vector(to_unsigned(CFG_SAT3_PRN - 1, 5));
+
+        if sw_test_mode = '1' and ram_wr_acq = '1' then
+            if CFG_SAT1_EN and ram_wr_addr = sat1_prn_i then
+                ram_wr_doppler_rep <= std_logic_vector(to_signed(CFG_SAT1_DOPPLER, 8));
+                ram_wr_phase_rep   <= std_logic_vector(to_unsigned(CFG_SAT1_PHASE, 10));
+            elsif CFG_SAT2_EN and ram_wr_addr = sat2_prn_i then
+                ram_wr_doppler_rep <= std_logic_vector(to_signed(CFG_SAT2_DOPPLER, 8));
+                ram_wr_phase_rep   <= std_logic_vector(to_unsigned(CFG_SAT2_PHASE, 10));
+            elsif CFG_SAT3_EN and ram_wr_addr = sat3_prn_i then
+                ram_wr_doppler_rep <= std_logic_vector(to_signed(CFG_SAT3_DOPPLER, 8));
+                ram_wr_phase_rep   <= std_logic_vector(to_unsigned(CFG_SAT3_PHASE, 10));
             end if;
         end if;
     end process;
@@ -654,6 +726,7 @@ begin
                      HYST_ACQ_SWEEPS  => CFG_HYST_ACQ_SWEEPS,
                      HYST_REL_SWEEPS  => CFG_HYST_REL_SWEEPS,
                      LOCK_SNR_MIN     => CFG_LOCK_SNR_MIN,
+                     ADAPT_NOISE_SHIFT=> ADAPT_NOISE_SHIFT,
                      PHASE_BIAS       => CFG_PHASE_BIAS,
                      NUM_PRNS         => CFG_NUM_PRNS,
                      N_INT            => CFG_N_INT,
@@ -700,12 +773,14 @@ begin
                   wr_en        => ram_we,
                   wr_addr      => ram_wr_addr,
                   wr_acq       => ram_wr_acq,
-                  wr_doppler   => ram_wr_doppler,
-                  wr_phase     => ram_wr_phase,
+                  wr_doppler   => ram_wr_doppler_rep,
+                  wr_phase     => ram_wr_phase_rep,
                   wr_snr       => ram_wr_snr_s,
                   wr_noise     => ram_wr_noise_s,
                   wr_margin    => ram_wr_margin_s,
                   wr_flags     => ram_wr_flags_s,
+                  diag_iq_valid=> diag_iq_valid_s,
+                  diag_iq_err  => diag_iq_err_s,
                   sweep_start  => sweep_restart_s,
                   report_start => acq_done,
                   uart_tx_pin  => uart_tx_pin,

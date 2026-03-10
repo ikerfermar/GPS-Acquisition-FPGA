@@ -8,7 +8,7 @@ use IEEE.NUMERIC_STD.ALL;
 -- Barre NUM_PRNS codigos CA x (2*BIN_RANGE+1) bins Doppler.
 -- Por cada (PRN, bin) acumula N_INT epochs de integracion no
 -- coherente (suma lineal de peak) y declara adquisicion si:
---   prn_best_accum > ACCUM_THRESHOLD  Y
+--   prn_best_accum > ACCUM_THRESHOLD + (noise >> ADAPT_NOISE_SHIFT)
 --   prn_best_accum > K_CFAR * prn_best_noise_accum
 --
 -- NOTA: el escalado CFAR se realiza con cfar_scale(), que soporta
@@ -29,6 +29,9 @@ entity acquisition_controller is
         HYST_REL_SWEEPS  : integer := 2;
         -- SNR minimo para declarar lock, en escala truncada [19:4].
         LOCK_SNR_MIN     : integer := 1;
+        -- Umbral adaptativo por ruido: dynamic_thr = base + (noise >> ADAPT_NOISE_SHIFT)
+        -- Si ADAPT_NOISE_SHIFT=0, equivale a sumar noise completa.
+        ADAPT_NOISE_SHIFT : integer := 1;
         -- Correccion fija (chips) para alinear la fase reportada con la
         -- fase fisica esperada en pruebas de banco.
         PHASE_BIAS       : integer := 0;
@@ -242,6 +245,7 @@ begin
         variable v_margin   : unsigned(23 downto 0);
         variable v_margin16 : unsigned(15 downto 0);
         variable raw_acq_v  : std_logic;
+        variable dyn_thr_v  : unsigned(23 downto 0);
         variable cfar_ok_v  : boolean;
         variable cfar_strict_ok_v : boolean;
         variable margin_boost_ok_v : boolean;
@@ -448,8 +452,9 @@ begin
                                 second_dom_ok_v := (prn_best_accum >
                                         (prn_second_accum + shift_right(prn_second_accum, 3)));
                                 snr_floor_ok_v := (prn_best_accum(19 downto 4) >= to_unsigned(LOCK_SNR_MIN, 16));
-                                -- SNR claramente por encima del suelo para permitir
-                                -- lock inicial aunque margen/second no sean fuertes.
+                                -- SNR claramente por encima del suelo (telemetria).
+                                -- Se mantiene para diagnostico, pero no habilita por si
+                                -- solo un lock inicial ambiguo entre bins cercanos.
                                 snr_headroom_ok_v := (prn_best_accum(19 downto 4) >= to_unsigned(LOCK_SNR_MIN + 8, 16));
 
                         -- Para adquirir lock por primera vez exigimos una prueba
@@ -457,15 +462,21 @@ begin
                         -- CFAR estricto. Una vez bloqueado, permitimos criterio
                         -- mas flexible para no perder lock por jitter de cuantizacion.
                         if prn_locked(prn_idx) = '0' then
-                            raw_lock_gate_ok_v := cfar_strict_ok_v and
-                                                  (second_dom_ok_v or margin_base_ok_v or
-                                                   margin_boost_ok_v or snr_headroom_ok_v);
+                            -- En primer lock permitimos alternativa CFAR+SNR alto
+                            -- para no perder satelites validos en mezcla multi-sat
+                            -- cuando best-second queda muy comprimido por cuantizacion.
+                            raw_lock_gate_ok_v := (cfar_strict_ok_v and
+                                                   (second_dom_ok_v or margin_base_ok_v or
+                                                    margin_boost_ok_v)) or
+                                                  (cfar_ok_v and snr_headroom_ok_v);
                         else
                             raw_lock_gate_ok_v := (cfar_strict_ok_v or second_dom_ok_v or
                                                    margin_boost_ok_v or margin_support_ok_v);
                         end if;
 
-                        if prn_best_accum > ACCUM_THRESHOLD and
+                        dyn_thr_v := ACCUM_THRESHOLD + shift_right(prn_best_noise_accum, ADAPT_NOISE_SHIFT);
+
+                        if prn_best_accum > dyn_thr_v and
                                 snr_floor_ok_v and
                                 cfar_ok_v and
                                 raw_lock_gate_ok_v
@@ -507,7 +518,7 @@ begin
                         prn_locked(prn_idx)   <= v_lock;
 
                         flags_v := (others => '0');
-                        if prn_best_accum > ACCUM_THRESHOLD then flags_v(0) := '1'; end if;
+                        if prn_best_accum > dyn_thr_v then flags_v(0) := '1'; end if;
                         if cfar_ok_v         then flags_v(1) := '1'; end if;
                         if cfar_strict_ok_v  then flags_v(2) := '1'; end if;
                         if margin_base_ok_v  then flags_v(3) := '1'; end if;
@@ -529,13 +540,30 @@ begin
                             phase_jump_i := phase_circular_diff(prn_best_pos, prn_lock_phase(prn_idx));
 
                             raw_update_ok_v := true;
-                            if v_lock = '1' then
-                                if abs(best_dop_i - lock_dop_i) > 1 and best_snr_i < (lock_snr_i + 8) then
+                            -- Filtro anti-salto solo cuando YA estaba en lock antes
+                            -- de este barrido. Si acaba de pasar de unlock->lock,
+                            -- se debe sembrar siempre con el mejor candidato actual.
+                            if prn_locked(prn_idx) = '1' then
+                                -- En lock activo, para mover Doppler/fase exigimos
+                                -- evidencia adicional: mejora SNR y separacion minima
+                                -- frente a bins competidores. Esto reduce saltos 1-bin
+                                -- espurios en barrido sintetico multi-senal.
+                                if abs(best_dop_i - lock_dop_i) > 0 and
+                                   (best_snr_i < (lock_snr_i + 4) or
+                                    not (second_dom_ok_v or margin_base_ok_v)) then
                                     raw_update_ok_v := false;
                                 end if;
-                                if phase_jump_i > 32 and best_snr_i < (lock_snr_i + 8) then
+                                if phase_jump_i > 16 and
+                                   (best_snr_i < (lock_snr_i + 4) or
+                                    not (second_dom_ok_v or margin_base_ok_v)) then
                                     raw_update_ok_v := false;
                                 end if;
+                            end if;
+
+                            -- Proteccion adicional: nunca dejar lock sembrado en cero.
+                            if prn_locked(prn_idx) = '0' and
+                               unsigned(prn_lock_snr(prn_idx)) = 0 then
+                                raw_update_ok_v := true;
                             end if;
 
                             if raw_update_ok_v then

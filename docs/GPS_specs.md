@@ -72,37 +72,5 @@ El diseño en la FPGA Basys-3 (Artix-7) implementa:
 5. **Sin estimador analógico de amplitud instantánea en FPGA:** las decisiones dependen de acumulación temporal de picos de correlación; no es posible medir potencia de señal en una sola muestra.
 6. **Sensibilidad a glitches digitales en I1/I0:** transiciones espúreas en las líneas de datos degradan la correlación. En formato sign-magnitude, I1 e I0 **no son señales complementarias** — ambas pueden ser 0 o 1 simultáneamente — por lo que la mitigación se basa exclusivamente en doble flip-flop de sincronización independiente por línea, tal como impone el cruce de dominio de reloj entre el MAX2769C y la FPGA.
 
-## 6. Mitigaciones implementadas en FPGA
-
-| Limitación | Mitigación en diseño | Estado |
-| :--- | :--- | :--- |
-| Cuantización 2 bits | Integración no coherente y criterio estadístico de adquisición | Implementado |
-| I-only (sin Q analógica) | Mezcla digital I/Q en FPGA con NCO y LUT seno/coseno | Implementado |
-| IF fija 4.092 MHz | Barrido Doppler en adquisición | Implementado (adquisición). Seguimiento FLL/PLL: pendiente |
-| Near-far multi-sat | Ganancias por satélite en generador sintético | Implementado para test. AGC/SIC real: pendiente |
-| Glitches I1/I0 | Doble FF de sincronización independiente por línea (I1 e I0) | Implementado |
-
-### Capacidad simultánea de satélites (contexto práctico)
-
-- **Señal sintética de este proyecto:** hasta 3 simultáneos (SAT1/SAT2/SAT3), porque el generador inyecta 3 fuentes.
-- **Front-end real (MAX2769C State 2):** la cadena de adquisición es multisitio por barrido PRN×Doppler; el número visible por barrido depende de `CFG_NUM_PRNS`, `CFG_BIN_RANGE` y `CFG_N_INT` (compromiso cobertura/tiempo).
-
-Para reducir recompilaciones durante pruebas, conviene mantener un bitstream de operación con `CFG_NUM_PRNS=32` y ajustar la validación rápida con switches (manual/auto, doppler manual) en lugar de cambiar constantes en cada iteración.
-
-## 7. Plan de Implementación Recomendado (sin romper timing)
-
-Implementar todas las mitigaciones de golpe no es recomendable en esta plataforma si se quiere mantener trazabilidad de resultados.
-
-Fases sugeridas:
-
-1. **Bajo riesgo:** umbral adaptativo por ruido, contadores de errores de muestreo I1/I0 y exportación UART de métricas.
-2. **Riesgo medio:** integración coherente extendida (4-10 ms) y FLL simple de frecuencia residual.
-3. **Riesgo alto:** PLL de seguimiento fino y AGC vía SPI al MAX2769C (registro CONF2, bits GAINREF 26:15 y AGCMODE 12:11, Table 24, p.23).
-4. **Muy alto coste:** cancelación sucesiva de interferencia (SIC) y/o Q sintética por transformada de Hilbert digital.
-
-Este orden reduce regresiones y facilita validar cada mejora frente a logs UART/Vivado.
-
-En la práctica: cuando el barrido sintético alcance 3 satélites de forma recurrente y estable (sin intercambios frecuentes de Doppler/fase), es razonable iniciar la **Fase A** sin esperar a conectar el front-end real.
-
 ---
 *Nota: Información extraída del datasheet oficial MAX2769C de Maxim Integrated (Rev. 1, 10/2016), páginas 4, 10, 14, 16, 20, 22, 23.*

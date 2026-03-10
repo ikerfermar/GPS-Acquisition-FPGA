@@ -106,7 +106,9 @@ RE_ACQ_HEX = re.compile(
 RE_NOLOCK_HEX = re.compile(
     r'SAT\s+([0-9A-Fa-f]{2}):\s+NOLOCK(?:\s+n=([0-9A-Fa-f]{4})\s+m=([0-9A-Fa-f]{4})\s+f=([0-9A-Fa-f]{2}))?'
 )
-RE_TOTAL_HEX  = re.compile(r'TOTAL:\s+([0-9A-Fa-f]{2})\s+sats')
+RE_TOTAL_HEX  = re.compile(
+    r'TOTAL:\s+([0-9A-Fa-f]{2})\s+sats(?:\s+v=([0-9A-Fa-f]{4})\s+e=([0-9A-Fa-f]{4}))?'
+)
 RE_HDR    = re.compile(r'=== GPS ACQUISITION RESULTS ===')
 RE_FTR    = re.compile(r'^={10,}$')
 
@@ -144,6 +146,8 @@ class State:
 
         self.sweep_count = 0
         self.total_sats  = 0
+        self.iq_valid    = 0
+        self.iq_err      = 0
         self.port_status = 'connecting'
         self.status_msg  = ''
         self.last_ts     = None
@@ -273,6 +277,9 @@ class State:
         if m:
             with self.lock:
                 self.total_sats = int(m.group(1), 16)
+                if m.group(2) is not None:
+                    self.iq_valid = int(m.group(2), 16)
+                    self.iq_err = int(m.group(3), 16)
 
 
 # ──────────────────────────────────────────────────────────────

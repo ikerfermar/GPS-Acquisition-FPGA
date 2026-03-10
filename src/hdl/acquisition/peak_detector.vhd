@@ -32,7 +32,9 @@ architecture Behavioral of peak_detector is
     signal current_max  : unsigned(15 downto 0) := (others => '0');
     signal current_pos  : unsigned(9 downto 0)  := (others => '0');
     signal sample_cnt   : unsigned(9 downto 0)  := (others => '0');
-    signal sum_accum    : unsigned(31 downto 0) := (others => '0'); -- acumulador suma total
+    -- Maximo teorico: 1024 * 65534 = 67,106,816 (< 2^26), por lo que
+    -- 26 bits bastan y reducen logica en la ruta critica de ruido.
+    signal sum_accum    : unsigned(25 downto 0) := (others => '0'); -- acumulador suma total
 
     signal max_pos_reg    : std_logic_vector(9 downto 0)  := (others => '0');
     signal max_val_reg    : std_logic_vector(15 downto 0) := (others => '0');
@@ -47,8 +49,8 @@ begin
         variable v_im_abs   : unsigned(15 downto 0);
         variable v_mag      : unsigned(15 downto 0);
         variable v_max      : unsigned(15 downto 0);
-        variable v_sum      : unsigned(31 downto 0);
-        variable noise_sum  : unsigned(31 downto 0);
+        variable v_sum      : unsigned(25 downto 0);
+        variable noise_sum  : unsigned(25 downto 0);
     begin
         if rising_edge(clk) then
             if reset_n = '0' then

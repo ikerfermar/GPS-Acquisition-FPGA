@@ -59,11 +59,11 @@ package gps_config_pkg is
     -- 0x0100 filtra locks ambiguos donde d/a se intercambian entre barridos.
     -- Margen minimo moderado: filtra intercambios inestables de bin pero
     -- evita bloquear adquisiciones validas de potencia media.
-    constant CFG_MIN_MARGIN : integer := 16#0001#;
+    constant CFG_MIN_MARGIN : integer := 16#0002#;
 
     -- SNR minimo para declarar lock en escala truncada [19:4] (UART snr).
     -- Ayuda a eliminar locks espurios de baja energia (p.ej. SAT4 en test).
-    constant CFG_LOCK_SNR_MIN : integer := 2;
+    constant CFG_LOCK_SNR_MIN : integer := 3;
 
     -- Histeresis temporal (en numero de barridos) para estabilizar lock/no-lock.
     -- En sintetico multi-sat conviene lock rapido (1 barrido bueno) para
@@ -117,8 +117,10 @@ package gps_config_pkg is
     constant CFG_SAT3_PRN    : integer := 3;
     constant CFG_SAT3_DOPPLER: integer := 16;    -- bins (+16 -> +5120 Hz)
     constant CFG_SAT3_PHASE  : integer := 600;
-    constant CFG_SAT3_GAIN   : integer := 3;     -- equilibrado con SAT1/SAT2 para barrido estable
+    constant CFG_SAT3_GAIN   : integer := 5;     -- refuerzo SAT3 para mejorar robustez de lock en barrido sintetico
     constant CFG_SAT3_EN     : boolean := true;
 
+    -- Fase A: umbral adaptativo por ruido (dynamic_thr = base + noise>>shift)
+    constant ADAPT_NOISE_SHIFT : integer := 1;
 
 end package gps_config_pkg;

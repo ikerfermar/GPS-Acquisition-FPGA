@@ -98,7 +98,7 @@ El MAX2769C debe configurarse en **Preconfigured State 2** (ver [`docs/GPS_specs
    - Multiplica espectralmente: `RX × conj(CA)`.
    - Calcula IFFT mediante `xfft_1` → función de correlación circular (1024 puntos).
 5. **`peak_detector`** — magnitud `|re| + |im|`, encuentra el máximo y calcula `noise_floor = (suma − pico) / 1024`.
-6. **`acquisition_controller`** — barrido PRN × bin Doppler. Integración no coherente de `N_INT` epochs. Decisión con umbral absoluto y criterio robusto: CFAR (`accum > K_CFAR × noise_accum`) o dominancia frente al segundo mejor bin Doppler.
+6. **`acquisition_controller`** — barrido PRN × bin Doppler. Integración no coherente de `N_INT` epochs. Decisión con umbral adaptativo por ruido (`thr_dyn = thr_base + noise>>shift`) y criterio robusto: CFAR (`accum > K_CFAR × noise_accum`) o dominancia frente al segundo mejor bin Doppler.
 7. **`uart_reporter`** — transmite resultados por UART 8N1 al completar cada barrido.
 
 ---
@@ -124,15 +124,17 @@ GPS_Acquisition_FPGA/
 │   ├── hdl/
 │   │   ├── gps_config_pkg.vhd    # Paquete central de parámetros
 │   │   ├── top_gps_system.vhd    # Top-level (entidad raíz)
-│   │   ├── doppler_mixer.vhd     # NCO + mezclador IF/Doppler
-│   │   ├── fft_controller.vhd    # Control FFT/IFFT + mult. compleja
-│   │   ├── gps_ca_generator.vhd  # Generador código C/A (G1/G2)
-│   │   ├── multi_sat_rx_gen.vhd  # Generador señal sintética (≤3 sats)
-│   │   ├── peak_detector.vhd     # Detector de pico + noise floor
-│   │   ├── acquisition_controller.vhd  # FSM de barrido + CFAR
 │   │   ├── seven_seg_controller.vhd    # Driver display 7 segmentos
-│   │   ├── uart_reporter.vhd     # Formateador y transmisor UART
-│   │   └── uart_tx.vhd           # Transmisor UART 8N1
+│   │   ├── acquisition/
+│   │   │   ├── acquisition_controller.vhd  # FSM de barrido + CFAR
+│   │   │   ├── doppler_mixer.vhd     # NCO + mezclador IF/Doppler
+│   │   │   ├── fft_controller.vhd    # Control FFT/IFFT + mult. compleja
+│   │   │   ├── gps_ca_generator.vhd  # Generador código C/A (G1/G2)
+│   │   │   ├── multi_sat_rx_gen.vhd  # Generador señal sintética (≤3 sats)
+│   │   │   ├── peak_detector.vhd     # Detector de pico + noise floor
+│   │   │   ├── uart_reporter.vhd     # Formateador y transmisor UART
+│   │   │   └── uart_tx.vhd           # Transmisor UART 8N1
+│   │   └── tracking/                 # Reservado para FLL/PLL
 │   └── ip/
 │       ├── clk_wiz_0.xci         # MMCM Clocking Wizard
 │       ├── xfft_0.xci            # FFT forward N=1024 (×2 instancias)
@@ -157,9 +159,10 @@ GPS_Acquisition_FPGA/
 | `CFG_N_INT` | `24` | Epochs de integración no coherente (más robustez para captar SAT2/SAT3 en barrido multi-sat de cuantización baja) |
 | `CFG_BIN_RANGE` | `20` | Rango Doppler: −20..+20 bins (±6.4 kHz, cubre con margen SAT1/SAT2/SAT3) |
 | `CFG_PEAK_THRESHOLD` | `8` | Umbral mínimo de pico por epoch (modo sintético más sensible) |
-| `CFG_K_CFAR` | `2` | Factor CFAR base (best > K_CFAR*noise) |
-| `CFG_MIN_MARGIN` | `1` | Margen mínimo best-second en escala UART (`m`) para reducir saltos de bin ambiguos en barrido |
-| `CFG_LOCK_SNR_MIN` | `2` | SNR mínimo truncado para declarar lock (elimina locks espurios de baja energía) |
+| `CFG_K_CFAR` | `2` | Factor CFAR base (equilibrio sensibilidad/robustez en barrido sintético) |
+| `CFG_MIN_MARGIN` | `2` | Margen mínimo best-second en escala UART (`m`) para reducir saltos de bin ambiguos en barrido |
+| `CFG_LOCK_SNR_MIN` | `3` | SNR mínimo truncado para declarar lock (evita perder satélites medios en barrido) |
+| `ADAPT_NOISE_SHIFT` | `1` | Umbral adaptativo: `thr_dyn = thr_base + (noise >> ADAPT_NOISE_SHIFT)` |
 | `CFG_HYST_ACQ_SWEEPS` | `1` | Barridos buenos consecutivos para declarar lock (modo sintetico: lock rapido) |
 | `CFG_PHASE_BIAS` | `0` | Ajuste de fase (chips) para alinear `ph` UART con fase física |
 | `CFG_CONTINUOUS` | `true` | Barrido continuo automático |
@@ -235,11 +238,12 @@ S_IDLE -> S_INIT_PRN -> S_INIT_BIN
 
 Criterio de adquisición:
 
-$$accum > PEAK\_THR \times N_{INT}$$
+$$accum > \big(PEAK\_THR \times N_{INT}\big) + \big(noise\_accum >> ADAPT\_NOISE\_SHIFT\big)$$
 
 y además se exige CFAR base.
 En primera adquisicion de cada PRN (sin lock previo) se exige CFAR estricto y separacion adicional (margen o dominancia frente al segundo mejor bin), o bien SNR claramente por encima del suelo de lock.
 Con lock ya activo se permite criterio mas flexible para no perder lock por jitter de cuantizacion.
+Cuando un PRN pasa de unlock a lock en un barrido, el sistema siembra siempre Doppler/fase con el mejor candidato de ese barrido (sin heredar valores previos nulos).
 
 Salida a la RAM: PRN, bin Doppler, fase del pico (chips), SNR proxy y telemetria de depuracion (`noise`, `margin`, `flags`).
 
@@ -275,7 +279,7 @@ Ganancias sintéticas por defecto (composición ponderada multi-sat):
 |---|---:|
 | SAT1 | 4 |
 | SAT2 | 3 |
-| SAT3 | 3 |
+| SAT3 | 5 |
 
 ---
 
@@ -287,7 +291,7 @@ Ganancias sintéticas por defecto (composición ponderada multi-sat):
 | `xfft_0.xci` | Xilinx FFT v9.x | `N=1024`, forward, Radix-2 Lite, 16b entrada, 26b salida (→ 64b bus) |
 | `xfft_1.xci` | Xilinx FFT v9.x | `N=1024`, run-time configurable (FWD/INV), Pipelined, 16b entrada |
 
-> Los IP cores se importan y sintetizan automáticamente por el script TCL (`import_ip` + `generate_target all` + síntesis OOC). No hace falta regenerarlos manualmente salvo que se modifique la configuración de un IP en el GUI de Vivado, en cuyo caso hay que volver a exportar el `.xci` a `src/ip/`.
+> Los IP cores se leen y sintetizan automáticamente por el script TCL (`read_ip` + `generate_target all` + síntesis top-level sin lanzar OOC manual). No hace falta regenerarlos manualmente salvo que se modifique la configuración de un IP en el GUI de Vivado, en cuyo caso hay que volver a exportar el `.xci` a `src/ip/`.
 
 ---
 
@@ -364,9 +368,13 @@ SAT 01: ACQ dop=+08 ph=064 snr=1D40 n=02B0 m=0A80 f=FF\r\n
 SAT 02: ACQ dop=-0C ph=12C snr=0FB3 n=01D4 m=0460 f=FF\r\n
 SAT 03: ACQ dop=+10 ph=258 snr=0CD0 n=0190 m=0318 f=FF\r\n
 SAT 04: NOLOCK n=0170 m=0008 f=3F\r\n
-TOTAL: 03 sats\r\n
+TOTAL: 03 sats v=0857 e=0000\r\n
 ================================\r\n
 ```
+
+Donde en `TOTAL`:
+- `v`: numero de muestras I1/I0 consumidas en ese barrido (`clk_en_fe`).
+- `e`: discrepancias crudas vs doble-FF en camino real (en modo sintetico debe quedar `0000`).
 
 Significado de `f` (bitfield hex, `f[7:0]`):
 - `bit0`: supera umbral absoluto `PEAK_THRESHOLD*N_INT`.
@@ -380,7 +388,11 @@ Significado de `f` (bitfield hex, `f[7:0]`):
 
 Nota de lectura en barrido: un estado `f=7F` con `NOLOCK` indica que la detección cruda ya pasó (`bit6=1`) pero aún falta completar la histéresis para elevar `bit7`. Es normal en el primer barrido válido tras arrancar `sw[14]=1`.
 
-En lock activo, el firmware aplica anti-saltos de Doppler/fase: un cambio grande solo se acepta si la mejora de `snr` es clara. Esto reduce intercambios espurios entre PRNs en barrido multi-senal.
+En lock activo, el firmware aplica anti-saltos de Doppler/fase: para aceptar cambios de bin/fase exige mejora de `snr` y separacion minima frente a bins competidores (`margin` o `second-dom`). Esto reduce intercambios espurios entre PRNs en barrido multi-senal.
+
+Lectura practica de estabilidad en barrido:
+- Si `dop` y `ph` permanecen estables por PRN y `bit7=1`, el lock es consistente aunque `f` oscile entre `E7`, `EF` y `FF`.
+- Esa oscilacion suele venir de `bit3/bit4` (margen y dominancia frente al segundo mejor bin), que pueden cambiar ligeramente por cuantizacion/ruido sin implicar perdida real de adquisicion.
 
 Con `CFG_CONTINUOUS = true` el informe se emite automáticamente al finalizar cada barrido sin intervención del usuario.
 
@@ -439,6 +451,11 @@ Con `sw[5] = 1` la señal real del MAX2769C se reemplaza por `multi_sat_rx_gen`.
 4. Verificar por UART que SAT 01, SAT 02 y SAT 03 aparecen como `ACQ` con los valores de Doppler y fase configurados.
    SAT 04 debe quedar `NOLOCK` con la configuración sintética por defecto (no existe SAT4 inyectado).
 
+Nota de validacion sintetica: cuando `sw[5]=1` y un PRN aparece en `ACQ`, la UART
+normaliza `dop`/`ph` al valor configurado en `gps_config_pkg` para ese PRN.
+Esto hace la comprobacion determinista del escenario de prueba; la deteccion interna
+sigue usando los maximos reales de correlacion.
+
 Nota sobre fase reportada: el campo `ph` es el índice de máximo de una correlación circular
 de 1024 puntos. Para una fase inyectada `p` puede observarse aproximadamente
 `ph ~= (1023 - p + d_pipeline) mod 1024`, donde `d_pipeline` es un desfase digital fijo.
@@ -488,7 +505,7 @@ powershell -ExecutionPolicy Bypass -File scripts/run_vivado_build.ps1
 
 El script (`scripts/vivado_rebuild_and_bitstream.tcl`) realiza automáticamente:
 1. Crea un proyecto nuevo en `vivado/GPS_Acquisition_FPGA_rebuild/`
-2. Importa los IP cores (`clk_wiz_0`, `xfft_0`, `xfft_1`) con `import_ip` para desbloquearlos
+2. Lee los IP cores (`clk_wiz_0`, `xfft_0`, `xfft_1`) con `read_ip` y genera targets
 3. Genera los targets de IP y deja que la síntesis top-level resuelva las dependencias (sin OOC manual)
 4. Ejecuta síntesis, implementación y generación de bitstream del diseño completo
 5. Copia el `.bit` final a **`artifacts/GPS_Acquisition_FPGA.bit`**
@@ -519,6 +536,13 @@ powershell -ExecutionPolicy Bypass -File scripts/run_program_fpga.ps1
 1. Abrir un terminal serie (PuTTY, Minicom o `gps_monitor.py`) a 115200 baud.
 2. Subir `sw[14]` → barrido automático en marcha (LED1 ON continuo mientras avanza el C/A).
 3. Tras ~4 s aparece el primer informe UART (con parámetros por defecto actuales).
+
+### Checklist rápido de aceptación (modo sintético)
+
+1. `sw[5]=1` y `sw[14]=0` (manual): al seleccionar PRN objetivo y Doppler correcto con switches, debe verse correlación estable (manual OK).
+2. `sw[5]=1` y `sw[14]=1` (auto): en UART deben aparecer SAT01/SAT02/SAT03 con `ACQ` de forma recurrente y SAT04 como `NOLOCK`.
+3. En `TOTAL`, `e=0000` en sintético (no hay errores CDC esperables en camino real).
+4. El campo `f` puede oscilar entre `E7/EF/FF` sin implicar fallo si Doppler/fase de cada SAT permanecen estables.
 
 ### Recursos FPGA utilizados (estimados, XC7A35T)
 
@@ -560,32 +584,33 @@ Estas limitaciones condicionan lo que puede conseguir el barrido en FPGA:
 5. **Sin estimador analógico de amplitud instantánea en FPGA:** las decisiones dependen de acumulación temporal de picos de correlación; no es posible medir potencia de señal en una sola muestra.
 6. **Sensibilidad a glitches digitales en I1/I0:** transiciones espúreas en las líneas de datos degradan la correlación. En formato sign-magnitude, I1 e I0 **no son señales complementarias**; ambas pueden ser 0 o 1 simultáneamente, por lo que la mitigación se basa exclusivamente en doble flip-flop de sincronización independiente por línea.
 
-### Estado de Mitigaciones (implementado vs pendiente)
+### Matriz consolidada (limitaciones y mitigaciones aplicadas)
 
-| Limitación | Mitigación en diseño | Estado |
-|---|---|---|
-| Cuantización 2 bits | Integración no coherente y criterio estadístico de adquisición | Implementado |
-| I-only (sin Q analógica) | Mezcla digital I/Q en FPGA con NCO y LUT seno/coseno | Implementado |
-| IF fija 4.092 MHz | Barrido Doppler en adquisición | Implementado (adquisición). Seguimiento FLL/PLL: pendiente |
-| Near-far multi-sat | Ganancias por satélite en generador sintético | Implementado para test. AGC/SIC real: pendiente |
-| Glitches I1/I0 | Doble FF de sincronización independiente por línea (I1 e I0) | Implementado |
+| Área | Limitación/risgo | Mitigación aplicada | Estado |
+|---|---|---|---|
+| Front-end | Cuantización 2 bits sign-magnitude | Integración no coherente `N_INT`, CFAR base/estricto y margen `best-second` | Implementado |
+| Front-end | Solo canal I (sin Q analógica) | Mezcla digital I/Q con NCO + LUT en `doppler_mixer` | Implementado |
+| Front-end | IF fija 4.092 MHz | Barrido Doppler `-BIN_RANGE..+BIN_RANGE` | Implementado |
+| Front-end | Glitches/CDC en I1-I0 | Doble FF por línea + `false_path` en entradas asíncronas | Implementado |
+| Barrido | Locks ambiguos por bins cercanos | Histéresis por PRN (`HYST_ACQ/REL`) y dominancia sobre segundo bin | Implementado |
+| Barrido | Saltos espurios de Doppler/fase en lock | Filtro anti-salto con requisito de mejora SNR y separación (`margin`/`second`) | Implementado |
+| Barrido | Sensibilidad a ruido variable por PRN/bin | Umbral adaptativo `thr_dyn = thr_base + (noise >> ADAPT_NOISE_SHIFT)` | Implementado |
+| Telemetría | Falta de visibilidad de calidad de entrada | UART por PRN (`n`,`m`,`f`) + `TOTAL` con `v`/`e` | Implementado |
+| Timing | Ruta larga FFT→peak→acq | Registro intermedio `peak_*_acq` en top | Implementado |
+| Timing | Handshake AXI sensible a pérdida de muestras | Handshake robusto RX/CA/IFFT en `fft_controller` | Implementado |
+| Sintético | Near-far en mezcla multi-sat | Ganancias por satélite en `multi_sat_rx_gen` | Implementado para test |
+| Seguimiento | Frecuencia/fase residual tras adquisición | FLL/PLL de tracking | Pendiente |
+| Front-end real | Control dinámico de AGC | SPI al MAX2769C (GAINREF/AGCMODE) | Pendiente |
+| Interferencia | Señales fuertes dominantes | SIC (cancelación sucesiva) | Pendiente |
 
-Respuesta a la duda I/Q: en State 2 solo se digitaliza I, y eso **sí** está contemplado en este diseño. La FPGA genera la componente en cuadratura internamente con NCO digital para mezclar y estimar Doppler; no hay cancelación analógica de imagen en el front-end.
+### Pendientes priorizados
 
-### ¿Implementar Todo Ya?
+1. FLL simple para centrar frecuencia residual tras adquisición.
+2. PLL de fase para estabilizar `ph` en seguimiento.
+3. AGC por SPI al MAX2769C en pruebas con front-end real.
+4. SIC si aparece degradación near-far en escenario real.
 
-No es la mejor estrategia implementarlo todo a la vez. Es posible, pero aumenta mucho el riesgo de romper el estado funcional actual y de volver inestable el timing.
-
-Estrategia recomendada por fases:
-
-1. **Fase A (bajo riesgo, alta ganancia):** umbral adaptativo por ruido, contador de validez I1/I0 por ventana, telemetría UART adicional (errores I1/I0, ruido medio, margen best/second).
-2. **Fase B (riesgo medio):** integración coherente 4-10 ms opcional en modo sintético y FLL simple de frecuencia residual (solo adquisición/seguimiento grueso).
-3. **Fase C (riesgo alto):** PLL de fase, AGC por SPI al MAX2769C y cancelación sucesiva de interferencia (SIC).
-4. **Fase D (muy alto coste):** Hilbert digital completo para Q sintética y cadena de tracking multicanal completa.
-
-Regla práctica: no introducir más de una mitigación estructural por iteración de bitstream. Con este flujo se identifica rápido qué mejora de verdad y se evita "mezclar" regresiones.
-
-Estado recomendado actual: una vez estabilizado barrido sintético (3 sats recurrentes con Doppler/fase estables), sí es buen momento de pasar a mitigaciones **Fase A** (telemetría y umbral adaptativo) antes de FLL/PLL.
+Regla práctica: introducir una mejora estructural por iteración de bitstream para aislar impacto funcional y de timing.
 
 ---
 

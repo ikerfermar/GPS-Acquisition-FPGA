@@ -5,4 +5,6 @@ standard = "1993"
 files = [
   "src/hdl/gps_config_pkg.vhd",
   "src/hdl/*.vhd",
+  "src/hdl/acquisition/*.vhd",
+  "src/hdl/tracking/*.vhd",
 ]

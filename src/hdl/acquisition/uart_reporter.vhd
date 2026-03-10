@@ -21,7 +21,7 @@ use IEEE.NUMERIC_STD.ALL;
 --   "SAT XX: NOLOCK\r\n"
 --
 -- Footer total:
---   "TOTAL: XX sats\r\n"
+--   "TOTAL: XX sats v=XXXX e=XXXX\r\n"
 --   "================================\r\n"
 --
 -- Ventaja: nibble->hex no requiere ninguna division/mod.
@@ -47,6 +47,8 @@ entity uart_reporter is
         wr_noise     : in  STD_LOGIC_VECTOR(15 downto 0);
         wr_margin    : in  STD_LOGIC_VECTOR(15 downto 0);
         wr_flags     : in  STD_LOGIC_VECTOR(7 downto 0);
+        diag_iq_valid: in  STD_LOGIC_VECTOR(15 downto 0);
+        diag_iq_err  : in  STD_LOGIC_VECTOR(15 downto 0);
         sweep_start  : in  STD_LOGIC;
         report_start : in  STD_LOGIC;
         uart_tx_pin  : out STD_LOGIC;
@@ -134,15 +136,15 @@ architecture Behavioral of uart_reporter is
     signal line_idx : integer range 0 to 71 := 0;
     signal line_len : integer range 0 to 71 := 0;
 
-    signal tot_idx  : integer range 0 to 31 := 0;
-    signal tot_len  : integer range 0 to 31 := 0;
+    signal tot_idx  : integer range 0 to 47 := 0;
+    signal tot_len  : integer range 0 to 47 := 0;
 
     -- Line buffer: max 72 bytes.
     type buf72_t is array (0 to 71) of std_logic_vector(7 downto 0);
     signal lbuf : buf72_t := (others => x"20");
     -- Total buffer
-    type buf32_t is array (0 to 31) of std_logic_vector(7 downto 0);
-    signal tbuf : buf32_t := (others => x"20");
+    type buf48_t is array (0 to 47) of std_logic_vector(7 downto 0);
+    signal tbuf : buf48_t := (others => x"20");
 
     constant HDR_LEN : integer := 35;
     type rom35_t is array (0 to 34) of std_logic_vector(7 downto 0);
@@ -197,8 +199,8 @@ begin
     process(clk)
         variable vi      : integer range 0 to 71;
         variable b       : buf72_t;
-        variable tb      : buf32_t;
-        variable ti      : integer range 0 to 31;
+        variable tb      : buf48_t;
+        variable ti      : integer range 0 to 47;
         variable prn1    : unsigned(5 downto 0);   -- PRN+1 (1-based, 6 bits)
         variable dop_s   : std_logic;              -- sign bit of doppler
         variable dop_abs : std_logic_vector(7 downto 0); -- abs(doppler)
@@ -444,7 +446,7 @@ begin
                         end if;
 
                     when S_FORMAT_TOTAL =>
-                        -- "TOTAL: XX sats\r\n" (hex sat count)
+                        -- "TOTAL: XX sats v=XXXX e=XXXX\r\n" (todo en hex)
                         tb := (others => x"20");
                         ti := 0;
                         tb(ti) := x"54"; ti := ti + 1; -- T
@@ -461,6 +463,20 @@ begin
                         tb(ti) := x"61"; ti := ti + 1; -- a
                         tb(ti) := x"74"; ti := ti + 1; -- t
                         tb(ti) := x"73"; ti := ti + 1; -- s
+                        tb(ti) := x"20"; ti := ti + 1;
+                        tb(ti) := x"76"; ti := ti + 1; -- v
+                        tb(ti) := x"3D"; ti := ti + 1;
+                        tb(ti) := n2h(diag_iq_valid(15 downto 12)); ti := ti + 1;
+                        tb(ti) := n2h(diag_iq_valid(11 downto 8));  ti := ti + 1;
+                        tb(ti) := n2h(diag_iq_valid(7  downto 4));  ti := ti + 1;
+                        tb(ti) := n2h(diag_iq_valid(3  downto 0));  ti := ti + 1;
+                        tb(ti) := x"20"; ti := ti + 1;
+                        tb(ti) := x"65"; ti := ti + 1; -- e
+                        tb(ti) := x"3D"; ti := ti + 1;
+                        tb(ti) := n2h(diag_iq_err(15 downto 12)); ti := ti + 1;
+                        tb(ti) := n2h(diag_iq_err(11 downto 8));  ti := ti + 1;
+                        tb(ti) := n2h(diag_iq_err(7  downto 4));  ti := ti + 1;
+                        tb(ti) := n2h(diag_iq_err(3  downto 0));  ti := ti + 1;
                         tb(ti) := x"0D"; ti := ti + 1;
                         tb(ti) := x"0A"; ti := ti + 1;
                         tbuf    <= tb;

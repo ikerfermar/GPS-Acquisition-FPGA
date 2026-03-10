@@ -57,15 +57,15 @@ set ip_dir  [file join $repo_root "src" "ip"]
 
 set hdl_files [list \
     [file join $hdl_dir "gps_config_pkg.vhd"] \
-    [file join $hdl_dir "acquisition_controller.vhd"] \
-    [file join $hdl_dir "doppler_mixer.vhd"] \
-    [file join $hdl_dir "fft_controller.vhd"] \
-    [file join $hdl_dir "gps_ca_generator.vhd"] \
-    [file join $hdl_dir "multi_sat_rx_gen.vhd"] \
-    [file join $hdl_dir "peak_detector.vhd"] \
+    [file join $hdl_dir "acquisition" "acquisition_controller.vhd"] \
+    [file join $hdl_dir "acquisition" "doppler_mixer.vhd"] \
+    [file join $hdl_dir "acquisition" "fft_controller.vhd"] \
+    [file join $hdl_dir "acquisition" "gps_ca_generator.vhd"] \
+    [file join $hdl_dir "acquisition" "multi_sat_rx_gen.vhd"] \
+    [file join $hdl_dir "acquisition" "peak_detector.vhd"] \
     [file join $hdl_dir "seven_seg_controller.vhd"] \
-    [file join $hdl_dir "uart_reporter.vhd"] \
-    [file join $hdl_dir "uart_tx.vhd"] \
+    [file join $hdl_dir "acquisition" "uart_reporter.vhd"] \
+    [file join $hdl_dir "acquisition" "uart_tx.vhd"] \
     [file join $hdl_dir "top_gps_system.vhd"] \
 ]
 
