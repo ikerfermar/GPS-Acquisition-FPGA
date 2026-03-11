@@ -38,6 +38,10 @@ entity acquisition_controller is
         NUM_PRNS         : integer := 32;
         N_INT            : integer := 5;
         BIN_RANGE        : integer := 64;
+        PRN_ENABLE_MASK  : std_logic_vector(31 downto 0) := (others => '1');
+        COARSE_STEP      : integer := 2;
+        COARSE_N_INT     : integer := 3;
+        REFINE_WINDOW    : integer := 1;
         CONTINUOUS_SWEEP : boolean := true
     );
     Port (
@@ -162,6 +166,22 @@ architecture Behavioral of acquisition_controller is
         return diff;
     end function;
 
+    function next_enabled_prn(
+        mask      : std_logic_vector(31 downto 0);
+        start_idx : integer;
+        lim       : integer
+    ) return integer is
+    begin
+        for i in 0 to 31 loop
+            if i >= start_idx and i < lim then
+                if mask(i) = '1' then
+                    return i;
+                end if;
+            end if;
+        end loop;
+        return 32;
+    end function;
+
     type t_state is (
         S_IDLE, S_INIT_PRN, S_INIT_BIN,
         S_PRIME_WAIT_EPOCH, S_PRIME_WAIT_PEAK,
@@ -175,6 +195,9 @@ architecture Behavioral of acquisition_controller is
     signal prn_idx : integer range 0 to 31 := 0;
     signal bin_cnt : signed(7 downto 0)    := (others => '0');
     signal int_cnt : integer range 0 to 255 := 0;
+    signal coarse_mode : std_logic := '1';
+    signal coarse_best_bin : signed(7 downto 0) := (others => '0');
+    signal refine_bin_max : signed(7 downto 0) := (others => '0');
 
     signal bin_accum             : unsigned(23 downto 0) := (others => '0');
     signal noise_accum           : unsigned(23 downto 0) := (others => '0');
@@ -283,6 +306,14 @@ begin
         variable best_snr_i : integer range 0 to 65535;
         variable phase_jump_i : integer range 0 to 512;
         variable raw_update_ok_v : boolean;
+        variable next_prn_i : integer range 0 to 32;
+        variable found_prn_v : boolean;
+        variable int_target_v : integer range 1 to 255;
+        variable coarse_step_v : integer range 1 to 127;
+        variable refine_window_v : integer range 0 to 64;
+        variable coarse_best_i : integer range -128 to 127;
+        variable refine_min_i : integer range -128 to 127;
+        variable refine_max_i : integer range -128 to 127;
     begin
         if rising_edge(clk) then
             if reset_n = '0' then
@@ -290,6 +321,9 @@ begin
                 prn_idx              <= 0;
                 bin_cnt              <= (others => '0');
                 int_cnt              <= 0;
+                coarse_mode          <= '1';
+                coarse_best_bin      <= (others => '0');
+                refine_bin_max       <= (others => '0');
                 bin_accum            <= (others => '0');
                 noise_accum          <= (others => '0');
                 bin_best_val         <= (others => '0');
@@ -343,7 +377,13 @@ begin
                         acq_valid     <= '0';
                         sweep_running_r <= '0';
                         if start = '1' then
-                            prn_idx         <= 0;
+                            next_prn_i := next_enabled_prn(PRN_ENABLE_MASK, 0, NUM_PRNS);
+                            found_prn_v := (next_prn_i < NUM_PRNS);
+                            if found_prn_v then
+                                prn_idx <= next_prn_i;
+                            else
+                                prn_idx <= 0;
+                            end if;
                             sat_count_r     <= (others => '0');
                             glob_best_accum <= (others => '0');
                             sweep_running_r <= '1';
@@ -352,7 +392,11 @@ begin
                             candidate_cnt_r <= (others => '0');
                             sweep_time_last_r    <= (others => '0');
                             candidate_cnt_last_r <= (others => '0');
-                            state           <= S_INIT_PRN;
+                            if found_prn_v then
+                                state <= S_INIT_PRN;
+                            else
+                                state <= S_DONE;
+                            end if;
                         end if;
 
                     when S_INIT_PRN =>
@@ -362,7 +406,10 @@ begin
                         prn_best_dop         <= (others => '0');
                         prn_best_pos         <= (others => '0');
                         prn_acquired         <= '0';
+                        coarse_mode          <= '1';
                         bin_cnt              <= to_signed(-BIN_RANGE, 8);
+                        coarse_best_bin      <= to_signed(-BIN_RANGE, 8);
+                        refine_bin_max       <= to_signed(BIN_RANGE, 8);
                         state                <= S_INIT_BIN;
 
                     when S_INIT_BIN =>
@@ -424,6 +471,17 @@ begin
                         end if;
 
                     when S_ACCUMULATE =>
+                        if coarse_mode = '1' then
+                            int_target_v := COARSE_N_INT;
+                        else
+                            int_target_v := N_INT;
+                        end if;
+                        if int_target_v < 1 then
+                            int_target_v := 1;
+                        elsif int_target_v > 255 then
+                            int_target_v := 255;
+                        end if;
+
                         bin_accum   <= bin_accum   + resize(val_sq,   24);
                         noise_accum <= noise_accum + resize(noise_sq, 24);
 
@@ -432,9 +490,9 @@ begin
                             bin_best_pos <= latch_pos;
                         end if;
 
-                        -- Integrar siempre N_INT epochs para que todos los bins
-                        -- sean comparables con la misma ventana temporal.
-                        if int_cnt = N_INT - 1 then
+                        -- Integracion adaptativa por etapa:
+                        -- coarse usa COARSE_N_INT, refine usa N_INT.
+                        if int_cnt = int_target_v - 1 then
                             state <= S_COMPARE;
                         else
                             int_cnt <= int_cnt + 1;
@@ -442,20 +500,69 @@ begin
                         end if;
 
                     when S_COMPARE =>
+                        coarse_step_v := COARSE_STEP;
+                        if coarse_step_v < 1 then
+                            coarse_step_v := 1;
+                        elsif coarse_step_v > 127 then
+                            coarse_step_v := 127;
+                        end if;
+
+                        refine_window_v := REFINE_WINDOW;
+                        if refine_window_v < 0 then
+                            refine_window_v := 0;
+                        elsif refine_window_v > BIN_RANGE then
+                            refine_window_v := BIN_RANGE;
+                        end if;
+
                         if bin_accum > prn_best_accum then
                             prn_second_accum     <= prn_best_accum;
                             prn_best_accum       <= bin_accum;
                             prn_best_noise_accum <= noise_accum;
                             prn_best_dop         <= std_logic_vector(bin_cnt);
                             prn_best_pos         <= bin_best_pos;
+                            if coarse_mode = '1' then
+                                coarse_best_bin <= bin_cnt;
+                            end if;
                         elsif bin_accum > prn_second_accum then
                             prn_second_accum <= bin_accum;
                         end if;
-                        if bin_cnt = to_signed(BIN_RANGE, 8) then
-                            state <= S_END_PRN;
+                        if coarse_mode = '1' then
+                            if to_integer(bin_cnt) + coarse_step_v > BIN_RANGE then
+                                if bin_accum >= prn_best_accum then
+                                    coarse_best_i := to_integer(bin_cnt);
+                                else
+                                    coarse_best_i := to_integer(coarse_best_bin);
+                                end if;
+                                refine_min_i := coarse_best_i - refine_window_v;
+                                refine_max_i := coarse_best_i + refine_window_v;
+                                if refine_min_i < -BIN_RANGE then
+                                    refine_min_i := -BIN_RANGE;
+                                end if;
+                                if refine_max_i > BIN_RANGE then
+                                    refine_max_i := BIN_RANGE;
+                                end if;
+                                refine_bin_max <= to_signed(refine_max_i, 8);
+                                coarse_mode    <= '0';
+                                bin_cnt        <= to_signed(refine_min_i, 8);
+                                bin_accum      <= (others => '0');
+                                noise_accum    <= (others => '0');
+                                bin_best_val   <= (others => '0');
+                                bin_best_pos   <= (others => '0');
+                                int_cnt        <= 0;
+                                prime_wait_epochs <= 0;
+                                wait_peak_epochs  <= 0;
+                                state          <= S_PRIME_WAIT_EPOCH;
+                            else
+                                bin_cnt <= bin_cnt + to_signed(coarse_step_v, 8);
+                                state   <= S_INIT_BIN;
+                            end if;
                         else
-                            bin_cnt <= bin_cnt + 1;
-                            state   <= S_INIT_BIN;
+                            if bin_cnt = refine_bin_max then
+                                state <= S_END_PRN;
+                            else
+                                bin_cnt <= bin_cnt + 1;
+                                state   <= S_INIT_BIN;
+                            end if;
                         end if;
 
                     when S_END_PRN =>
@@ -661,11 +768,14 @@ begin
 
                     when S_WRITE_RAM =>
                         ram_we <= '1';
-                        if prn_idx >= NUM_PRNS - 1 then
-                            state <= S_DONE;
-                        else
-                            prn_idx <= prn_idx + 1;
+                        next_prn_i := next_enabled_prn(PRN_ENABLE_MASK, prn_idx + 1, NUM_PRNS);
+                        found_prn_v := (next_prn_i < NUM_PRNS);
+
+                        if found_prn_v then
+                            prn_idx <= next_prn_i;
                             state   <= S_INIT_PRN;
+                        else
+                            state   <= S_DONE;
                         end if;
 
                     when S_DONE =>
@@ -683,7 +793,13 @@ begin
                     when S_WAIT =>
                         acq_done <= '0';
                         if start = '1' or (CONTINUOUS_SWEEP and ca_epoch = '1' and epoch_prev = '0') then
-                            prn_idx         <= 0;
+                            next_prn_i := next_enabled_prn(PRN_ENABLE_MASK, 0, NUM_PRNS);
+                            found_prn_v := (next_prn_i < NUM_PRNS);
+                            if found_prn_v then
+                                prn_idx <= next_prn_i;
+                            else
+                                prn_idx <= 0;
+                            end if;
                             sat_count_r     <= (others => '0');
                             glob_best_accum <= (others => '0');
                             acq_valid       <= '0';
@@ -691,7 +807,11 @@ begin
                             sweep_restart   <= '1';
                             sweep_time_r    <= (others => '0');
                             candidate_cnt_r <= (others => '0');
-                            state           <= S_INIT_PRN;
+                            if found_prn_v then
+                                state <= S_INIT_PRN;
+                            else
+                                state <= S_DONE;
+                            end if;
                         end if;
 
                 end case;

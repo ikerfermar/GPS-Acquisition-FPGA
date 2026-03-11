@@ -260,6 +260,10 @@ architecture Structural of top_gps_system is
                  NUM_PRNS         : integer := 32;
                  N_INT            : integer := 5;
                  BIN_RANGE        : integer := 64;
+                 PRN_ENABLE_MASK  : std_logic_vector(31 downto 0) := (others => '1');
+                 COARSE_STEP      : integer := 2;
+                 COARSE_N_INT     : integer := 3;
+                 REFINE_WINDOW    : integer := 1;
                  CONTINUOUS_SWEEP : boolean  := true);
         port (clk            : in  std_logic;
               reset_n        : in  std_logic;
@@ -749,6 +753,10 @@ begin
                      NUM_PRNS         => CFG_NUM_PRNS,
                      N_INT            => CFG_N_INT,
                      BIN_RANGE        => CFG_BIN_RANGE,
+                     PRN_ENABLE_MASK  => CFG_PRN_ENABLE_MASK,
+                     COARSE_STEP      => CFG_COARSE_STEP,
+                     COARSE_N_INT     => CFG_COARSE_N_INT,
+                     REFINE_WINDOW    => CFG_REFINE_WINDOW,
                      CONTINUOUS_SWEEP => CFG_CONTINUOUS)
         port map (clk            => clk_100MHz,
                   reset_n        => acq_reset_n,

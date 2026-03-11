@@ -9,8 +9,11 @@ use IEEE.NUMERIC_STD.ALL;
 -- cambios a top_gps_system, acquisition_controller y uart_reporter.
 -- Anadir al proyecto como fuente adicional (Add Sources).
 --
--- Tiempo de barrido: T = NUM_PRNS * (2*BIN_RANGE+1) * N_INT * 1ms
---   Perfil actual: 4 * 41 * 24 * 1ms = 3.936 s
+-- Tiempo de barrido clasico: T = NUM_PRNS * (2*BIN_RANGE+1) * N_INT * 1ms
+-- Perfil clasico de referencia: 4 * 41 * 24 * 1ms = 3.936 s
+-- Con Fase 1 (coarse+refine):
+--   T ~= N_PRN_act * (ceil((2*BIN_RANGE+1)/COARSE_STEP)*COARSE_N_INT
+--                    + (2*REFINE_WINDOW+1)*N_INT) * 1ms
 -- =============================================================
 
 package gps_config_pkg is
@@ -25,6 +28,10 @@ package gps_config_pkg is
     --  32  -> busca todos los satelites GPS
     constant CFG_NUM_PRNS : integer := 4;
 
+    -- Mascara de PRNs habilitados en barrido (bit 0=PRN1, bit 31=PRN32).
+    -- En validacion sintetica se habilitan PRN1..PRN4 para reducir tiempo.
+    constant CFG_PRN_ENABLE_MASK : std_logic_vector(31 downto 0) := x"0000000F";
+
     -- Epochs de integracion no coherente por bin Doppler
     -- Ganancia SNR = 10 x log10(N_INT) dB
     --   1  ->  0 dB, mas rapido
@@ -36,6 +43,10 @@ package gps_config_pkg is
     -- en mezcla multi-senal con cuantizacion limitada.
     constant CFG_N_INT : integer := 24;
 
+    -- Integracion usada en etapa gruesa del barrido Doppler.
+    -- Debe ser <= CFG_N_INT para acelerar sin perder refinamiento final.
+    constant CFG_COARSE_N_INT : integer := 6;
+
     -- Rango de barrido Doppler en bins (barrido: -BIN_RANGE..+BIN_RANGE)
     -- Frecuencia cubierta = BIN_RANGE x 320 Hz
     --  20  -> +/-6400 Hz  (GPS real, satelites con velocidad orbital normal)
@@ -45,6 +56,13 @@ package gps_config_pkg is
     -- Rango ajustado al escenario sintetico actual (dopplers +/-8, -12, +16).
     -- Menos bins reduce falsos maximos lejanos y acelera el barrido.
     constant CFG_BIN_RANGE : integer := 20;
+
+    -- Paso en bins para etapa gruesa (1=desactivado, 2=mitad de bins, etc.).
+    constant CFG_COARSE_STEP : integer := 2;
+
+    -- Ventana de refinamiento alrededor del mejor bin grueso.
+    -- Se evalua en paso 1 dentro de [best-REFINE_WINDOW, best+REFINE_WINDOW].
+    constant CFG_REFINE_WINDOW : integer := 2;
 
     -- Umbral minimo del pico de correlacion por epoch.
     -- Valor normal para evitar falsas adquisiciones.

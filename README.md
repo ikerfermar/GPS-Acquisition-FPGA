@@ -156,8 +156,12 @@ GPS_Acquisition_FPGA/
 | Constante | Valor por defecto | Descripción |
 |---|---|---|
 | `CFG_NUM_PRNS` | `4` | PRNs a barrer (1..4) para validación rápida |
+| `CFG_PRN_ENABLE_MASK` | `0x0000000F` | Máscara de PRNs activas (bit0=PRN1) para saltar PRNs no usadas |
 | `CFG_N_INT` | `24` | Epochs de integración no coherente (más robustez para captar SAT2/SAT3 en barrido multi-sat de cuantización baja) |
+| `CFG_COARSE_N_INT` | `6` | Integración de etapa coarse (más rápida que la etapa refine) |
 | `CFG_BIN_RANGE` | `20` | Rango Doppler: −20..+20 bins (±6.4 kHz, cubre con margen SAT1/SAT2/SAT3) |
+| `CFG_COARSE_STEP` | `2` | Paso Doppler de la etapa coarse (2 = evalúa bins alternos) |
+| `CFG_REFINE_WINDOW` | `2` | Ventana refine alrededor del mejor bin coarse (`best±2`) |
 | `CFG_PEAK_THRESHOLD` | `8` | Umbral mínimo de pico por epoch (modo sintético más sensible) |
 | `CFG_K_CFAR` | `2` | Factor CFAR base (equilibrio sensibilidad/robustez en barrido sintético) |
 | `CFG_MIN_MARGIN` | `2` | Margen mínimo best-second en escala UART (`m`) para reducir saltos de bin ambiguos en barrido |
@@ -169,11 +173,25 @@ GPS_Acquisition_FPGA/
 | `CFG_CLK_FREQ` | `100_000_000` | Frecuencia de reloj en Hz |
 | `CFG_BAUD_RATE` | `115_200` | Baudios UART |
 
-**Tiempo de barrido completo:**
+**Tiempo de barrido (modelo clásico, una sola etapa):**
 
 $$T_{barrido} = N_{PRN} \times (2 \times BIN\_RANGE + 1) \times N_{INT} \times 1\text{ ms}$$
 
 Con los valores por defecto: $4 \times 41 \times 24 \times 1\text{ ms} \approx \mathbf{3.94\text{ s}}$
+
+**Tiempo de barrido (Fase 1, dos etapas coarse+refine):**
+
+$$
+T_{2etapas} \approx N_{PRN,act} \times \Big(\left\lceil\frac{2\cdot BIN\_RANGE + 1}{COARSE\_STEP}\right\rceil \cdot N_{INT,coarse} + (2\cdot REFINE\_WINDOW + 1)\cdot N_{INT}\Big) \times 1\text{ ms}
+$$
+
+Con los valores por defecto actuales: $N_{PRN,act}=4$, $BIN\_RANGE=20$, $COARSE\_STEP=2$, $N_{INT,coarse}=6$, $REFINE\_WINDOW=2$, $N_{INT}=24$:
+
+$$
+T_{2etapas} \approx 4 \times (21\cdot 6 + 5\cdot 24)\text{ ms} = 984\text{ ms}
+$$
+
+La reducción frente al barrido clásico es aproximadamente $3.94/0.984 \approx 4\times$ para este perfil.
 
 ---
 
@@ -412,8 +430,8 @@ Donde en `TOTAL`:
 - `candidates=XX`: número de PRNs que pasaron CFAR pero no completaron el criterio de lock (2 dígitos hex). Indicador de "margen real": valores altos indican muchos candidatos cercanos (mezcla multi-satélite apretada o ruido variable); valores bajos indican clara separación entre PRNs adquiridos y rechazados.
 
 Referencia práctica con la configuración sintética por defecto (`NUM_PRNS=4`, `BIN_RANGE=20`, `N_INT=24`):
-- Tiempo observado esperado: ~8.0–8.4 s por barrido.
-- Ciclos esperados: ~800M–840M ciclos (aprox. `0x2FAF0800`..`0x321B4A00`) con variación pequeña por latencias de estados.
+- Tiempo observado esperado: ~2.1–2.3 s por barrido.
+- Ciclos esperados: ~210M–230M ciclos (aprox. `0x0C845880`..`0x0DBBA000`) con variación pequeña por latencias de estados.
 
 Nota: el tiempo medido incluye no solo `N_INT` acumulaciones por bin, sino también los estados de espera de `epoch/peak` y el frame de purga por bin del pipeline FFT/IFFT, por eso resulta mayor que la cota ideal simplificada.
 
@@ -490,7 +508,7 @@ Con `sw[5] = 1` la señal real del MAX2769C se reemplaza por `multi_sat_rx_gen`.
 
 1. Subir `sw[5]` → LED0 encendido.
 2. Subir `sw[14]` → inicia barrido automático.
-3. Esperar ~4 s (con los parámetros por defecto actuales, ~3.94 s por barrido).
+3. Esperar ~2.2 s (con los parámetros por defecto actuales, ~2.1–2.3 s por barrido observado).
 4. Verificar por UART que SAT 01, SAT 02 y SAT 03 aparecen como `ACQ` con los valores de Doppler y fase configurados.
    SAT 04 debe quedar `NOLOCK` con la configuración sintética por defecto (no existe SAT4 inyectado).
 
@@ -578,7 +596,7 @@ powershell -ExecutionPolicy Bypass -File scripts/run_program_fpga.ps1
 
 1. Abrir un terminal serie (PuTTY, Minicom o `gps_monitor.py`) a 115200 baud.
 2. Subir `sw[14]` → barrido automático en marcha (LED1 ON continuo mientras avanza el C/A).
-3. Tras ~4 s aparece el primer informe UART (con parámetros por defecto actuales).
+3. Tras ~2.2 s aparece el primer informe UART (con parámetros por defecto actuales).
 
 ### Checklist rápido de aceptación (modo sintético)
 
@@ -648,13 +666,6 @@ Estas limitaciones condicionan lo que puede conseguir el barrido en FPGA:
 
 ### Plan de mejoras por fases
 
-#### Fase 1: Reducción de tiempo de barrido con 32 PRNs
-
-1. Implementar barrido en dos etapas: coarse rápido y refine solo sobre candidatos.
-2. Introducir `N_INT` adaptativo por PRN/candidato para no integrar de más en bins débiles.
-3. Añadir máscara/configuración de PRNs activas para evitar barrido completo cuando no sea necesario.
-4. **Validación:** verificar con sweep_time y candidates que tiempo de barrido se reduce sin pérdida de locks válidos.
-
 #### Fase 2: Entrada a tracking
 
 1. Integrar FLL simple para centrar error de frecuencia residual tras adquisición.
@@ -679,7 +690,9 @@ Estas limitaciones condicionan lo que puede conseguir el barrido en FPGA:
 ✅ **Tuning runtime sin resíntesis:** 6 switches dedicados (sw[13:10], sw[9:7]) para ajustar margin_delta y snr_delta.  
 ✅ **Presets de laboratorio:** tabla de configuraciones Strict/Balanced/Relaxed para barridos rápidos.  
 ✅ **Telemetría mejorada:** sweep_time_cycles (ciclos de reloj del barrido) y candidate_count (PRNs pre-lock).  
-✅ **Validación teórica:** timing MET (WNS=0.212ns), sin errores VHDL, logs confirmados.  
+✅ **Fase 1 de reducción de barrido implementada:** coarse+refine Doppler, `N_INT` por etapa y máscara de PRNs activas.  
+✅ **Validación en sintético reportada:** barrido estable con 3 ACQ + 1 NOLOCK y `SWEEP cycles` alrededor de `0x0CF7xxxx` (~2.18 s).  
+✅ **Validación teórica:** timing MET en último log (WNS≈0.243 ns), sin errores de síntesis/implementación.  
 
 ---
 
