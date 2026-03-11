@@ -124,6 +124,11 @@ architecture Structural of top_gps_system is
     signal sweep_prn       : std_logic_vector(4 downto 0);
     signal sweep_running   : std_logic;
     signal sweep_restart_s : std_logic;
+    signal sweep_time_cycles_s : std_logic_vector(31 downto 0);
+    signal candidate_count_s   : std_logic_vector(7 downto 0);
+    signal tune_en_s       : std_logic;
+    signal tune_margin_delta_s : std_logic_vector(2 downto 0);
+    signal tune_snr_delta_s    : std_logic_vector(2 downto 0);
 
     -- Control
     signal sw_ff1      : std_logic_vector(15 downto 0) := (others => '0');
@@ -264,6 +269,9 @@ architecture Structural of top_gps_system is
               peak_val       : in  std_logic_vector(15 downto 0);
               peak_pos       : in  std_logic_vector(9 downto 0);
               noise_floor    : in  std_logic_vector(15 downto 0);
+              tune_en        : in  std_logic;
+              tune_margin_delta : in std_logic_vector(2 downto 0);
+              tune_snr_delta    : in std_logic_vector(2 downto 0);
               doppler_sel    : out std_logic_vector(7 downto 0);
               prn_out        : out std_logic_vector(4 downto 0);
               ram_we         : out std_logic;
@@ -285,7 +293,9 @@ architecture Structural of top_gps_system is
               sweep_bin      : out std_logic_vector(7 downto 0);
               sweep_prn      : out std_logic_vector(4 downto 0);
               sweep_running  : out std_logic;
-              sweep_restart  : out std_logic);
+              sweep_restart  : out std_logic;
+              sweep_time_cycles : out std_logic_vector(31 downto 0);
+              candidate_count    : out std_logic_vector(7 downto 0));
     end component;
 
     component uart_reporter
@@ -306,6 +316,8 @@ architecture Structural of top_gps_system is
               wr_flags     : in  std_logic_vector(7 downto 0);
               diag_iq_valid: in  std_logic_vector(15 downto 0);
               diag_iq_err  : in  std_logic_vector(15 downto 0);
+              sweep_time_cycles  : in  std_logic_vector(31 downto 0);
+              candidate_count    : in  std_logic_vector(7 downto 0);
               sweep_start  : in  std_logic;
               report_start : in  std_logic;
               uart_tx_pin  : out std_logic;
@@ -442,6 +454,12 @@ begin
     doppler_offset_mux <= doppler_offset
                           when (sw_auto_mode = '1' and CFG_AUTO_DOPPLER_OFFSET_ENABLE)
                           else x"00";
+
+    -- Ajuste runtime de umbrales en sintetico+auto sin resintesis:
+    -- sw13=enable, sw12:10=delta margen (signed 3b), sw9:7=delta SNR (signed 3b)
+    tune_en_s           <= sw_auto_mode and sw_test_mode and sw_sync(13);
+    tune_margin_delta_s <= sw_sync(12 downto 10);
+    tune_snr_delta_s    <= sw_sync(9 downto 7);
 
     -- Deteccion flanco sw[14] para disparar barrido
     process(clk_100MHz)
@@ -740,6 +758,9 @@ begin
                   peak_val       => val_pico_acq,
                   peak_pos       => pos_pico_acq,
                   noise_floor    => noise_floor_acq,
+                  tune_en        => tune_en_s,
+                  tune_margin_delta => tune_margin_delta_s,
+                  tune_snr_delta    => tune_snr_delta_s,
                   doppler_sel    => doppler_sel_auto,
                   prn_out        => prn_out,
                   ram_we         => ram_we,
@@ -761,7 +782,9 @@ begin
                   sweep_bin      => sweep_bin,
                   sweep_prn      => sweep_prn,
                   sweep_running  => sweep_running,
-                  sweep_restart  => sweep_restart_s);
+                  sweep_restart  => sweep_restart_s,
+                  sweep_time_cycles => sweep_time_cycles_s,
+                  candidate_count    => candidate_count_s);
 
     uart_reporter_inst : uart_reporter
         generic map (CLK_FREQ  => CFG_CLK_FREQ,
@@ -781,6 +804,8 @@ begin
                   wr_flags     => ram_wr_flags_s,
                   diag_iq_valid=> diag_iq_valid_s,
                   diag_iq_err  => diag_iq_err_s,
+                  sweep_time_cycles => sweep_time_cycles_s,
+                  candidate_count => candidate_count_s,
                   sweep_start  => sweep_restart_s,
                   report_start => acq_done,
                   uart_tx_pin  => uart_tx_pin,

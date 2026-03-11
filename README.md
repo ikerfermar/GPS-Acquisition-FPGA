@@ -325,9 +325,40 @@ constant CFG_BIN_RANGE   : integer := 24;  -- ±7.68 kHz, suficiente para Dopple
 |---|---|
 | `sw[4:0]` | PRN manual (modo manual: PRN = sw[4:0] + 1, rango 1..32). En sintético selecciona el PRN local de correlación, con señal multi-satélite activa. |
 | `sw[5]` | `0` = señal real (MAX2769C) · `1` = señal sintética |
-| `sw[13:6]` | Doppler en modo manual: bin directo (complemento a 2, 1 bin = 320 Hz); en modo auto: offset fino añadido sobre el bin automático |
+| `sw[13:6]` | Modo manual: Doppler bin directo (C2, 1 bin = 320 Hz). Modo auto+sintético: tuning runtime de umbrales (sin resintetizar), ver tabla inferior |
 | `sw[14]` | `0` = modo manual · `1` = activa barrido automático (flanco subida = inicio) |
 | `sw[15]` | Modo display — en auto: `0` = bin Doppler · `1` = PRN del barrido; en manual: `0` = PRN manual · `1` = fase del pico (ver tabla Display) |
+
+### Tuning runtime de umbrales (solo auto+sintético)
+
+Cuando `sw[14]=1` y `sw[5]=1`, puedes ajustar sensibilidad sin recompilar:
+
+| Switches | Función |
+|---|---|
+| `sw[13]` | Enable tuning (`1` activo, `0` usa valores de `gps_config_pkg`) |
+| `sw[12:10]` | Delta margen `MIN_MARGIN` en signed 3-bit (`-4..+3`) |
+| `sw[9:7]` | Delta suelo SNR `LOCK_SNR_MIN` en signed 3-bit (`-4..+3`) |
+| `sw[6]` | Reservado |
+
+Regla práctica:
+- Si faltan locks válidos: baja `sw[9:7]` (delta SNR negativo) o baja `sw[12:10]`.
+- Si aparecen locks espurios: sube `sw[9:7]` y/o sube `sw[12:10]`.
+
+Con `sw[13]=0` el comportamiento es idéntico al baseline por configuración fija.
+
+### Presets de laboratorio
+
+Valores sugeridos para `sw[13:10]` y `sw[9:7]` (margin delta y SNR delta) con la configuración sintética estándar:
+
+| Nombre | `sw[13]` | `sw[12:10]` | `sw[9:7]` | Efecto | Uso |
+|---|---|---|---|---|---|
+| **Strict** | 1 | 001 (+1) | 001 (+1) | Mayor margen, SNR más alto | Eliminar espurios, señales débiles |
+| **Baseline** | 0 | — | — | Configuración fija `gps_config_pkg` | Referencia, estabilidad garantizada |
+| **Balanced** | 1 | 000 (0) | 000 (0) | Sin ajuste pero tuning habilitado | Transición suave de baseline |
+| **Relaxed** | 1 | 111 (-1) | 111 (-1) | Menor margen, SNR más bajo | Señales débiles, mezcla multi-sat |
+| **Very Relaxed** | 1 | 110 (-2) | 110 (-2) | Sensibilidad máxima | Diagnóstico, señales muy débiles |
+
+> **Nota:** Los valores signed 3-bit en VHDL se interpretan como: `000=0, 001=+1, ..., 011=+3, 100=-4, 101=-3, ..., 111=-1`. Para cambiar valor negativo: ajusta `sw[i:j]` tal que su binario en 3 bits corresponda al complemento a dos. Ejemplo: delta=-2 (SNR más bajo) → `sw[9:7]=110` (binary).
 
 ### LEDs
 
@@ -362,19 +393,31 @@ El display se actualiza cada 250 ms para facilitar la lectura.
 Al completar cada barrido el sistema emite (formato HEX en el firmware actual):
 
 ```
-\r\n
-=== GPS ACQUISITION RESULTS ===\r\n
-SAT 01: ACQ dop=+08 ph=064 snr=1D40 n=02B0 m=0A80 f=FF\r\n
-SAT 02: ACQ dop=-0C ph=12C snr=0FB3 n=01D4 m=0460 f=FF\r\n
-SAT 03: ACQ dop=+10 ph=258 snr=0CD0 n=0190 m=0318 f=FF\r\n
-SAT 04: NOLOCK n=0170 m=0008 f=3F\r\n
-TOTAL: 03 sats v=0857 e=0000\r\n
-================================\r\n
+=== GPS ACQUISITION RESULTS ===
+SAT 01: ACQ dop=+08 ph=064 snr=1D40 n=02B0 m=0A80 f=FF
+SAT 02: ACQ dop=-0C ph=12C snr=0FB3 n=01D4 m=0460 f=FF
+SAT 03: ACQ dop=+10 ph=258 snr=0CD0 n=0190 m=0318 f=FF
+SAT 04: NOLOCK n=0170 m=0008 f=3F
+TOTAL: 03 sats v=0857 e=0000
+SWEEP: cycles=00FFA3A0 candidates=0B
+================================
 ```
 
 Donde en `TOTAL`:
 - `v`: numero de muestras I1/I0 consumidas en ese barrido (`clk_en_fe`).
 - `e`: discrepancias crudas vs doble-FF en camino real (en modo sintetico debe quedar `0000`).
+
+**Nuevo en Fase 1:** línea `SWEEP` al final:
+- `cycles=XXXXXXXX`: ciclos de reloj consumidos en el barrido (8 dígitos hex, 32 bits completos). Para estimar tiempo: `t_ms ~= cycles / 100000` @ 100 MHz.
+- `candidates=XX`: número de PRNs que pasaron CFAR pero no completaron el criterio de lock (2 dígitos hex). Indicador de "margen real": valores altos indican muchos candidatos cercanos (mezcla multi-satélite apretada o ruido variable); valores bajos indican clara separación entre PRNs adquiridos y rechazados.
+
+Referencia práctica con la configuración sintética por defecto (`NUM_PRNS=4`, `BIN_RANGE=20`, `N_INT=24`):
+- Tiempo observado esperado: ~8.0–8.4 s por barrido.
+- Ciclos esperados: ~800M–840M ciclos (aprox. `0x2FAF0800`..`0x321B4A00`) con variación pequeña por latencias de estados.
+
+Nota: el tiempo medido incluye no solo `N_INT` acumulaciones por bin, sino también los estados de espera de `epoch/peak` y el frame de purga por bin del pipeline FFT/IFFT, por eso resulta mayor que la cota ideal simplificada.
+
+Si aparecían valores de `cycles` muy bajos (p.ej. `0003xxxx`), era síntoma de lectura desfasada entre barridos; en la versión actual el valor se latcha al cerrar cada barrido y queda estable para la UART.
 
 Significado de `f` (bitfield hex, `f[7:0]`):
 - `bit0`: supera umbral absoluto `PEAK_THRESHOLD*N_INT`.
@@ -603,14 +646,40 @@ Estas limitaciones condicionan lo que puede conseguir el barrido en FPGA:
 | Front-end real | Control dinámico de AGC | SPI al MAX2769C (GAINREF/AGCMODE) | Pendiente |
 | Interferencia | Señales fuertes dominantes | SIC (cancelación sucesiva) | Pendiente |
 
-### Pendientes priorizados
+### Plan de mejoras por fases
 
-1. FLL simple para centrar frecuencia residual tras adquisición.
-2. PLL de fase para estabilizar `ph` en seguimiento.
-3. AGC por SPI al MAX2769C en pruebas con front-end real.
-4. SIC si aparece degradación near-far en escenario real.
+#### Fase 1: Reducción de tiempo de barrido con 32 PRNs
 
-Regla práctica: introducir una mejora estructural por iteración de bitstream para aislar impacto funcional y de timing.
+1. Implementar barrido en dos etapas: coarse rápido y refine solo sobre candidatos.
+2. Introducir `N_INT` adaptativo por PRN/candidato para no integrar de más en bins débiles.
+3. Añadir máscara/configuración de PRNs activas para evitar barrido completo cuando no sea necesario.
+4. **Validación:** verificar con sweep_time y candidates que tiempo de barrido se reduce sin pérdida de locks válidos.
+
+#### Fase 2: Entrada a tracking
+
+1. Integrar FLL simple para centrar error de frecuencia residual tras adquisición.
+2. Integrar PLL de fase para estabilizar `ph` en seguimiento continuo.
+3. Definir criterio de handoff ACQ->TRK y watchdog de pérdida de lock.
+
+#### Fase 3: Preparación front-end real (MAX2769C)
+
+1. Añadir control SPI de AGC (GAINREF/AGCMODE) para robustez en señal real.
+2. Validar offsets de frecuencia/fase y sesgos térmicos sobre IF fija (4.092 MHz).
+3. Reajustar thresholds por perfil real manteniendo compatibilidad con modo sintético.
+
+#### Fase 4: Mitigaciones avanzadas (solo si hace falta)
+
+1. Evaluar SIC (cancelación sucesiva) únicamente si aparece near-far real significativo.
+2. Evaluar paralelización de correladores si el tiempo de refresco con 32 PRNs no cumple objetivo.
+3. Mantener regla de integración incremental: una mejora estructural por iteración de bitstream para aislar impacto funcional y de timing.
+
+## Status de Implementación — Fase 1: Estabilización de adquisición (COMPLETADA)
+
+✅ **Baseline sintético consolidado:** Manual + auto modos con salida estable (SAT01-03 ACQ, SAT04 NOLOCK).  
+✅ **Tuning runtime sin resíntesis:** 6 switches dedicados (sw[13:10], sw[9:7]) para ajustar margin_delta y snr_delta.  
+✅ **Presets de laboratorio:** tabla de configuraciones Strict/Balanced/Relaxed para barridos rápidos.  
+✅ **Telemetría mejorada:** sweep_time_cycles (ciclos de reloj del barrido) y candidate_count (PRNs pre-lock).  
+✅ **Validación teórica:** timing MET (WNS=0.212ns), sin errores VHDL, logs confirmados.  
 
 ---
 

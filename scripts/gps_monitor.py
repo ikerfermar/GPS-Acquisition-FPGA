@@ -18,14 +18,15 @@ Ejecutar desde terminal (NO desde Spyder):
 Dependencias:
   pip install pyserial matplotlib numpy
 
-Formato UART esperado (v13 firmware):
-  SAT XX: ACQUIRED  doppler=±NNNNN Hz  phase=NNNN chips  snr=NNNNN
-  SAT XX: NO LOCK
+Formato UART heredado (legacy, no usado en firmware actual):
+    SAT XX: ACQUIRED  doppler=±NNNNN Hz  phase=NNNN chips  snr=NNNNN
+    SAT XX: NO LOCK
 
-Formato HEX v12 firmware (sin prefijo 0x, 'sats'):
-    SAT PP: ACQ dop=SDD ph=PPP snr=SSSS
-    SAT PP: NOLOCK
-    TOTAL: TT sats
+Formato HEX v12-v13 firmware (sin prefijo 0x):
+    SAT PP: ACQ dop=SDD ph=PPP snr=SSSS n=NNNN m=MMMM f=FF
+    SAT PP: NOLOCK n=NNNN m=MMMM f=FF
+    TOTAL: TT sats v=V e=EEEE
+    SWEEP: cycles=TTTTTTTT candidates=CC
 
 Etiquetas encima de cada barra: Doppler (kHz) y Code Phase (chips).
 El eje Y muestra el SNR proxy (adim. = adimensional, escala interna FPGA).
@@ -89,15 +90,16 @@ matplotlib.rcParams.update({
 })
 
 # ──────────────────────────────────────────────────────────────
-# Regex
-# NUEVO: captura campo snr=NNNNN al final de líneas ACQUIRED
+# Regex para parsing UART HEX v12-v13
 # ──────────────────────────────────────────────────────────────
+# Legacy textual format (decimal values)
 RE_ACQ    = re.compile(
-    r'SAT\s+(\d+):\s+ACQUIRED\s+doppler=([+-]\d+)\s+Hz\s+phase=(\d+)\s+chips'
-    r'(?:\s+snr=(\d+))?'   # snr es opcional para compatibilidad con firmware anterior
+    r'SAT\s+(\d+):\s+ACQUIRED\s+doppler=([+-]\d+)\s+Hz\s+phase=(\d+)\s+chips(?:\s+snr=(\d+))?'
 )
-RE_NOLOCK = re.compile(r'SAT\s+(\d+):\s+NO LOCK')
+RE_NOLOCK = re.compile(r'SAT\s+(\d+):\s+NO\s+LOCK')
 RE_TOTAL  = re.compile(r'TOTAL:\s+(\d+)\s+satellites')
+# SWEEP line (current format)
+RE_SWEEP  = re.compile(r'SWEEP:\s+cycles=([0-9A-Fa-f]+)\s+candidates=([0-9A-Fa-f]+)')
 # v12 firmware hex format: SAT XX: ACQ dop=SXX ph=XXX snr=XXXX  (no 0x prefix)
 RE_ACQ_HEX = re.compile(
     r'SAT\s+([0-9A-Fa-f]{2}):\s+ACQ\s+dop=([+-])([0-9A-Fa-f]{2})\s+ph=([0-9A-Fa-f]{3})\s+snr=([0-9A-Fa-f]{4})'
@@ -148,6 +150,8 @@ class State:
         self.total_sats  = 0
         self.iq_valid    = 0
         self.iq_err      = 0
+        self.sweep_time_ms = 0
+        self.sweep_candidates = 0
         self.port_status = 'connecting'
         self.status_msg  = ''
         self.last_ts     = None
@@ -280,6 +284,18 @@ class State:
                 if m.group(2) is not None:
                     self.iq_valid = int(m.group(2), 16)
                     self.iq_err = int(m.group(3), 16)
+            return
+
+        m = RE_SWEEP.match(line)
+        if m:
+            with self.lock:
+                sweep_time_cycles = int(m.group(1), 16)
+                candidates_count = int(m.group(2), 16)
+                # Convertir ciclos a ms (aprox. 100k ciclos = 1ms @ 100 MHz)
+                sweep_time_ms = sweep_time_cycles // 100000 if sweep_time_cycles > 0 else 0
+                # Guardar métricas para visualización en ventana 2
+                self.sweep_time_ms = sweep_time_ms
+                self.sweep_candidates = candidates_count
 
 
 # ──────────────────────────────────────────────────────────────

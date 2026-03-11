@@ -49,6 +49,9 @@ entity acquisition_controller is
         peak_val       : in  STD_LOGIC_VECTOR(15 downto 0);
         peak_pos       : in  STD_LOGIC_VECTOR(9 downto 0);
         noise_floor    : in  STD_LOGIC_VECTOR(15 downto 0);
+        tune_en        : in  STD_LOGIC;
+        tune_margin_delta : in STD_LOGIC_VECTOR(2 downto 0);
+        tune_snr_delta    : in STD_LOGIC_VECTOR(2 downto 0);
         doppler_sel    : out STD_LOGIC_VECTOR(7 downto 0);
         prn_out        : out STD_LOGIC_VECTOR(4 downto 0);
         ram_we         : out STD_LOGIC;
@@ -70,7 +73,9 @@ entity acquisition_controller is
         sweep_bin      : out STD_LOGIC_VECTOR(7 downto 0);
         sweep_prn      : out STD_LOGIC_VECTOR(4 downto 0);
         sweep_running  : out STD_LOGIC;
-        sweep_restart  : out STD_LOGIC
+        sweep_restart  : out STD_LOGIC;
+        sweep_time_cycles : out STD_LOGIC_VECTOR(31 downto 0);
+        candidate_count    : out STD_LOGIC_VECTOR(7 downto 0)
     );
 end acquisition_controller;
 
@@ -192,6 +197,12 @@ architecture Behavioral of acquisition_controller is
     signal bin_best_pos : std_logic_vector(9 downto 0) := (others => '0');
     signal epoch_prev   : std_logic := '0';
 
+    signal sweep_running_r : std_logic := '0';
+    signal sweep_time_r    : unsigned(31 downto 0) := (others => '0');
+    signal candidate_cnt_r : unsigned(7 downto 0)  := (others => '0');
+    signal sweep_time_last_r    : unsigned(31 downto 0) := (others => '0');
+    signal candidate_cnt_last_r : unsigned(7 downto 0)  := (others => '0');
+
     signal current_prn_slv : std_logic_vector(4 downto 0);
     signal ram_wr_addr_r   : std_logic_vector(4 downto 0)  := (others => '0');
     signal ram_wr_doppler_r : std_logic_vector(7 downto 0) := (others => '0');
@@ -227,6 +238,7 @@ begin
     prn_out        <= current_prn_slv;
     sweep_bin      <= std_logic_vector(bin_cnt);
     sweep_prn      <= current_prn_slv;
+    sweep_running  <= sweep_running_r;
     best_doppler   <= glob_best_dop;
     best_pos       <= glob_best_pos;
     -- Escala de telemetria: [19:4] para mantener resolucion util en sintetico.
@@ -240,6 +252,8 @@ begin
     ram_wr_noise   <= ram_wr_noise_r;
     ram_wr_margin  <= ram_wr_margin_r;
     ram_wr_flags   <= ram_wr_flags_r;
+    sweep_time_cycles <= std_logic_vector(sweep_time_last_r);
+    candidate_count <= std_logic_vector(candidate_cnt_last_r);
 
     process(clk)
         variable v_margin   : unsigned(23 downto 0);
@@ -255,6 +269,10 @@ begin
         variable snr_floor_ok_v    : boolean;
         variable snr_headroom_ok_v : boolean;
         variable raw_lock_gate_ok_v : boolean;
+        variable margin_delta_i : integer range -4 to 3;
+        variable snr_delta_i    : integer range -4 to 3;
+        variable eff_margin_i   : integer range 0 to 65535;
+        variable eff_snr_i      : integer range 1 to 65535;
         variable flags_v    : std_logic_vector(7 downto 0);
         variable v_hit      : integer range 0 to 15;
         variable v_miss     : integer range 0 to 15;
@@ -284,7 +302,7 @@ begin
                 epoch_prev           <= '0';
                 acq_done             <= '0';
                 acq_valid            <= '0';
-                sweep_running        <= '0';
+                sweep_running_r      <= '0';
                 sweep_restart        <= '0';
                 ram_we               <= '0';
                 ram_wr_doppler_r     <= (others => '0');
@@ -302,7 +320,18 @@ begin
                 prn_lock_phase       <= (others => (others => '0'));
                 prn_lock_dop         <= (others => (others => '0'));
                 prn_lock_snr         <= (others => (others => '0'));
+                sweep_time_r         <= (others => '0');
+                candidate_cnt_r      <= (others => '0');
+                sweep_time_last_r    <= (others => '0');
+                candidate_cnt_last_r <= (others => '0');
             else
+                -- Incrementar contador de ciclos de barrido mientras el barrido está activo
+                if sweep_running_r = '0' then
+                    -- Nada (contadores se reinician en S_IDLE)
+                else
+                    sweep_time_r <= sweep_time_r + 1;
+                end if;
+
                 epoch_prev    <= ca_epoch;
                 ram_we        <= '0';
                 sweep_restart <= '0';
@@ -312,13 +341,17 @@ begin
                     when S_IDLE =>
                         acq_done      <= '0';
                         acq_valid     <= '0';
-                        sweep_running <= '0';
+                        sweep_running_r <= '0';
                         if start = '1' then
                             prn_idx         <= 0;
                             sat_count_r     <= (others => '0');
                             glob_best_accum <= (others => '0');
-                            sweep_running   <= '1';
+                            sweep_running_r <= '1';
                             sweep_restart   <= '1';
+                            sweep_time_r    <= (others => '0');
+                            candidate_cnt_r <= (others => '0');
+                            sweep_time_last_r    <= (others => '0');
+                            candidate_cnt_last_r <= (others => '0');
                             state           <= S_INIT_PRN;
                         end if;
 
@@ -433,6 +466,25 @@ begin
                         end if;
                         v_margin16 := v_margin(19 downto 4);
 
+                        -- Ajuste runtime de umbrales (solo cuando tune_en='1').
+                        if tune_en = '1' then
+                            margin_delta_i := to_integer(signed(tune_margin_delta));
+                            snr_delta_i    := to_integer(signed(tune_snr_delta));
+                        else
+                            margin_delta_i := 0;
+                            snr_delta_i    := 0;
+                        end if;
+
+                        eff_margin_i := MIN_MARGIN + margin_delta_i;
+                        if eff_margin_i < 0 then
+                            eff_margin_i := 0;
+                        end if;
+
+                        eff_snr_i := LOCK_SNR_MIN + snr_delta_i;
+                        if eff_snr_i < 1 then
+                            eff_snr_i := 1;
+                        end if;
+
                                 -- Criterio de lock:
                                 -- 1) umbral absoluto siempre obligatorio,
                                 -- 2) CFAR o, alternativamente, margen reforzado,
@@ -441,21 +493,21 @@ begin
                         -- Importante: cuando MIN_MARGIN=0 no se debe anular CFAR.
                         cfar_ok_v := (prn_best_accum > cfar_scale(prn_best_noise_accum, K_CFAR));
                         cfar_strict_ok_v := (prn_best_accum > (prn_best_noise_accum + shift_right(prn_best_noise_accum, 1)));
-                        margin_boost_ok_v := (MIN_MARGIN > 0) and
-                                             (v_margin16 >= to_unsigned(MIN_MARGIN * 2, 16));
-                        margin_base_ok_v := (v_margin16 >= to_unsigned(MIN_MARGIN, 16));
-                        margin_support_ok_v := (MIN_MARGIN > 0) and margin_base_ok_v;
+                        margin_boost_ok_v := (eff_margin_i > 0) and
+                                             (v_margin16 >= to_unsigned(eff_margin_i * 2, 16));
+                        margin_base_ok_v := (v_margin16 >= to_unsigned(eff_margin_i, 16));
+                        margin_support_ok_v := (eff_margin_i > 0) and margin_base_ok_v;
                                 -- Fallback robusto en mezcla multi-satelite 1-bit:
                             -- best > 1.125 * second (second + second/8).
                                 -- Evita NOLOCK cuando el ruido agregado eleva CFAR,
                                 -- manteniendo preferencia por el mejor bin Doppler.
                                 second_dom_ok_v := (prn_best_accum >
                                         (prn_second_accum + shift_right(prn_second_accum, 3)));
-                                snr_floor_ok_v := (prn_best_accum(19 downto 4) >= to_unsigned(LOCK_SNR_MIN, 16));
+                                snr_floor_ok_v := (prn_best_accum(19 downto 4) >= to_unsigned(eff_snr_i, 16));
                                 -- SNR claramente por encima del suelo (telemetria).
                                 -- Se mantiene para diagnostico, pero no habilita por si
                                 -- solo un lock inicial ambiguo entre bins cercanos.
-                                snr_headroom_ok_v := (prn_best_accum(19 downto 4) >= to_unsigned(LOCK_SNR_MIN + 8, 16));
+                                snr_headroom_ok_v := (prn_best_accum(19 downto 4) >= to_unsigned(eff_snr_i + 8, 16));
 
                         -- Para adquirir lock por primera vez exigimos una prueba
                         -- adicional de separacion (margen o dominancia) junto con
@@ -484,6 +536,11 @@ begin
                             raw_acq_v := '1';
                         else
                             raw_acq_v := '0';
+                        end if;
+
+                        -- Contar kandidatos "pre-lock" (CFAR OK pero no raw_acq completo)
+                        if cfar_ok_v = true and raw_acq_v = '0' then
+                            candidate_cnt_r <= candidate_cnt_r + 1;
                         end if;
 
                         -- Histéresis temporal por PRN para estabilizar lock/no-lock.
@@ -613,7 +670,9 @@ begin
 
                     when S_DONE =>
                         acq_done      <= '1';
-                        sweep_running <= '0';
+                        sweep_running_r <= '0';
+                        sweep_time_last_r    <= sweep_time_r;
+                        candidate_cnt_last_r <= candidate_cnt_r;
                         if sat_count_r > 0 then
                             acq_valid <= '1';
                         else
@@ -628,8 +687,10 @@ begin
                             sat_count_r     <= (others => '0');
                             glob_best_accum <= (others => '0');
                             acq_valid       <= '0';
-                            sweep_running   <= '1';
+                            sweep_running_r <= '1';
                             sweep_restart   <= '1';
+                            sweep_time_r    <= (others => '0');
+                            candidate_cnt_r <= (others => '0');
                             state           <= S_INIT_PRN;
                         end if;
 

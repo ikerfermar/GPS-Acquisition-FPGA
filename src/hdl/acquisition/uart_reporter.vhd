@@ -49,6 +49,8 @@ entity uart_reporter is
         wr_flags     : in  STD_LOGIC_VECTOR(7 downto 0);
         diag_iq_valid: in  STD_LOGIC_VECTOR(15 downto 0);
         diag_iq_err  : in  STD_LOGIC_VECTOR(15 downto 0);
+        sweep_time_cycles  : in  STD_LOGIC_VECTOR(31 downto 0);
+        candidate_count    : in  STD_LOGIC_VECTOR(7 downto 0);
         sweep_start  : in  STD_LOGIC;
         report_start : in  STD_LOGIC;
         uart_tx_pin  : out STD_LOGIC;
@@ -77,6 +79,8 @@ architecture Behavioral of uart_reporter is
         S_SEND_LINE,
         S_FORMAT_TOTAL,
         S_SEND_TOTAL,
+        S_FORMAT_SWEEP,
+        S_SEND_SWEEP,
         S_SEND_FTR,
         S_DONE
     );
@@ -128,6 +132,9 @@ architecture Behavioral of uart_reporter is
 
     signal report_pend : std_logic := '0';
     signal sweep_pend  : std_logic := '0';
+
+    signal latched_sweep_time : std_logic_vector(31 downto 0) := (others => '0');
+    signal latched_candidate_cnt : std_logic_vector(7 downto 0) := (others => '0');
 
     signal sat_cnt  : unsigned(5 downto 0) := (others => '0');
     signal hdr_idx  : integer range 0 to 34 := 0;
@@ -482,9 +489,71 @@ begin
                         tbuf    <= tb;
                         tot_len <= ti;
                         tot_idx <= 0;
+                        latched_sweep_time <= sweep_time_cycles;
+                        latched_candidate_cnt <= candidate_count;
                         state <= S_SEND_TOTAL;
 
                     when S_SEND_TOTAL =>
+                        if tx_busy = '0' and tx_start_r = '0' then
+                            tx_data_r  <= tbuf(tot_idx);
+                            tx_start_r <= '1';
+                            if tot_idx = tot_len - 1 then
+                                ftr_idx <= 0;
+                                state   <= S_FORMAT_SWEEP;
+                            else
+                                tot_idx <= tot_idx + 1;
+                            end if;
+                        end if;
+
+                    when S_FORMAT_SWEEP =>
+                        -- "SWEEP: cycles=XXXXXXXX candidates=XX\r\n"
+                        tb := (others => x"20");
+                        ti := 0;
+                        tb(ti) := x"53"; ti := ti + 1; -- S
+                        tb(ti) := x"57"; ti := ti + 1; -- W
+                        tb(ti) := x"45"; ti := ti + 1; -- E
+                        tb(ti) := x"45"; ti := ti + 1; -- E
+                        tb(ti) := x"50"; ti := ti + 1; -- P
+                        tb(ti) := x"3A"; ti := ti + 1; -- :
+                        tb(ti) := x"20"; ti := ti + 1;
+                        tb(ti) := x"63"; ti := ti + 1; -- c
+                        tb(ti) := x"79"; ti := ti + 1; -- y
+                        tb(ti) := x"63"; ti := ti + 1; -- c
+                        tb(ti) := x"6C"; ti := ti + 1; -- l
+                        tb(ti) := x"65"; ti := ti + 1; -- e
+                        tb(ti) := x"73"; ti := ti + 1; -- s
+                        tb(ti) := x"3D"; ti := ti + 1;
+                        -- Reporte de 32 bits completos para evitar ambiguedad por truncado.
+                        tb(ti) := n2h(latched_sweep_time(31 downto 28)); ti := ti + 1;
+                        tb(ti) := n2h(latched_sweep_time(27 downto 24)); ti := ti + 1;
+                        tb(ti) := n2h(latched_sweep_time(23 downto 20)); ti := ti + 1;
+                        tb(ti) := n2h(latched_sweep_time(19 downto 16)); ti := ti + 1;
+                        tb(ti) := n2h(latched_sweep_time(15 downto 12)); ti := ti + 1;
+                        tb(ti) := n2h(latched_sweep_time(11 downto 8));  ti := ti + 1;
+                        tb(ti) := n2h(latched_sweep_time(7 downto 4));   ti := ti + 1;
+                        tb(ti) := n2h(latched_sweep_time(3 downto 0));   ti := ti + 1;
+                        tb(ti) := x"20"; ti := ti + 1;
+                        tb(ti) := x"63"; ti := ti + 1; -- c
+                        tb(ti) := x"61"; ti := ti + 1; -- a
+                        tb(ti) := x"6E"; ti := ti + 1; -- n
+                        tb(ti) := x"64"; ti := ti + 1; -- d
+                        tb(ti) := x"69"; ti := ti + 1; -- i
+                        tb(ti) := x"64"; ti := ti + 1; -- d
+                        tb(ti) := x"61"; ti := ti + 1; -- a
+                        tb(ti) := x"74"; ti := ti + 1; -- t
+                        tb(ti) := x"65"; ti := ti + 1; -- e
+                        tb(ti) := x"73"; ti := ti + 1; -- s
+                        tb(ti) := x"3D"; ti := ti + 1;
+                        tb(ti) := n2h(latched_candidate_cnt(7 downto 4)); ti := ti + 1;
+                        tb(ti) := n2h(latched_candidate_cnt(3 downto 0)); ti := ti + 1;
+                        tb(ti) := x"0D"; ti := ti + 1;
+                        tb(ti) := x"0A"; ti := ti + 1;
+                        tbuf    <= tb;
+                        tot_len <= ti;
+                        tot_idx <= 0;
+                        state <= S_SEND_SWEEP;
+
+                    when S_SEND_SWEEP =>
                         if tx_busy = '0' and tx_start_r = '0' then
                             tx_data_r  <= tbuf(tot_idx);
                             tx_start_r <= '1';
