@@ -1,0 +1,66 @@
+# ── Vivado temporaries ──
+*.cache/
+*.hw/
+*.ip_user_files/
+*.runs/
+*.sim/
+*.gen/
+.Xil/
+
+# ── Simulacion (Vivado XSIM / ondas) ──
+xsim.dir/
+*.wdb
+*.vcd
+xsim.jou
+xsim.log
+
+# Vivado project (rebuilt by scripts/vivado_rebuild_and_bitstream.tcl)
+vivado/
+
+# ── Logs and journals (regenerable) ──
+*.log
+*.jou
+*.str
+*.pb
+*.backup*
+dfx_runtime.txt
+# Java/Vivado crash dumps
+hs_err_pid*
+*.dmp
+
+# ── Build log run artifacts (regenerable per-run outputs) ──
+build_logs/**
+build_logs/latest_build.json
+
+# Permite mantener la carpeta build_logs vacia en git
+!build_logs/.gitkeep
+
+# ── TFM (LaTeX) outputs (regenerables) ──
+TFM/
+
+# Variante en minúsculas por compatibilidad entre entornos
+tfm/**
+
+# ── Python ──
+.venv/
+__pycache__/
+*.pyc
+
+# ── Build outputs (regenerable binaries) ──
+artifacts/*.bit
+artifacts/*.dcp
+artifacts/*.bin
+captures/*.capbin
+
+# Permite mantener estas carpetas vacias en git
+!artifacts/.gitkeep
+!captures/.gitkeep
+
+# ── Claude Code local settings ──
+.claude/
+
+# ── OS e IDEs ──
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

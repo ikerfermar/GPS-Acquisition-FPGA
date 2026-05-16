@@ -1,0 +1,9 @@
+[main]
+standard = "1993"
+
+[libraries.defaultlib]
+files = [
+  "src/hdl/gps_config_pkg.vhd",
+  "src/hdl/*.vhd",
+  "src/hdl/acquisition/*.vhd",
+]
